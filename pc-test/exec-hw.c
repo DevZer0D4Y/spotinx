@@ -36,45 +36,79 @@
  * exatamente apos a instalacao do TLS. O trampolim agora: salva guest TP, poe
  * host TP, chama C, restaura guest TP.
  */
-long g_host_tp;   /* capturado antes de saltar pro guest */
+long g_host_tp;      /* TP do host, capturado antes de saltar pro guest */
+long g_host_stack;   /* topo de um stack DEDICADO grande pro C do host/LKL */
 
+/*
+ * Trampolim (reescrito seguindo a 4a pesquisa — preservacao COMPLETA).
+ * O guest ve um `svc` inline: preserva x0-x18, x30, NZCV/FP, e o guest TP.
+ * (x0 e substituido pelo resultado da syscall, que e o contrato do svc.)
+ * - Salva/restaura x0-x15, x18, x30 (todos os caller-saved que a glibc pode ter
+ *   vivos no svc). x16/x17 do guest sao salvos pelo veneer de ENTRADA no stack do
+ *   guest e restaurados pelo veneer de SAIDA — por isso x16/x17 ficam livres aqui.
+ * - Entrada: x16 = endereco do veneer de SAIDA (o veneer de entrada passou).
+ * - Troca TPIDR_EL0 pro host (glibc instalou o do guest no setup_tls).
+ * - Troca pro stack dedicado (pc_do_syscall roda o kernel LKL inteiro).
+ * Frame (224B): x0-x15 em 0..120; x18,x30 em 128; x16exit,gtp em 144; nzcv,fpcr
+ * em 160; fpsr em 176; x19 em 184; x20,x21 em 192; result em 208.
+ */
 __asm__(
 	".text\n"
 	".global pc_trampoline\n"
 	".balign 4\n"
 	"pc_trampoline:\n"
-	"  sub sp, sp, #160\n"
-	"  stp x0, x1, [sp, #0]\n"
-	"  stp x2, x3, [sp, #16]\n"
-	"  stp x4, x5, [sp, #32]\n"
-	"  str x8, [sp, #48]\n"
-	"  stp x17, x30, [sp, #56]\n"  /* x17=retorno guest, x30=preserva o nosso */
-	/* preserva TODO estado que o C do host pode clobbrar e o guest espera intacto
-	 * (o guest ve um svc inline, nao uma chamada AAPCS): x6/x7, NZCV, FPCR/FPSR */
-	"  stp x6, x7, [sp, #80]\n"
-	"  mrs x11, nzcv\n"
-	"  mrs x12, fpcr\n"
-	"  mrs x13, fpsr\n"
-	"  stp x11, x12, [sp, #96]\n"
-	"  str x13, [sp, #112]\n"
-	"  mrs x9, tpidr_el0\n"         /* salva o TP do GUEST */
-	"  str x9, [sp, #120]\n"
-	"  adrp x10, g_host_tp\n"       /* carrega o TP do HOST e instala */
+	"  sub sp, sp, #224\n"
+	"  stp x0, x1,   [sp, #0]\n"
+	"  stp x2, x3,   [sp, #16]\n"
+	"  stp x4, x5,   [sp, #32]\n"
+	"  stp x6, x7,   [sp, #48]\n"
+	"  stp x8, x9,   [sp, #64]\n"
+	"  stp x10, x11, [sp, #80]\n"
+	"  stp x12, x13, [sp, #96]\n"
+	"  stp x14, x15, [sp, #112]\n"
+	"  stp x18, x30, [sp, #128]\n"
+	"  mrs x9, tpidr_el0\n"
+	"  stp x16, x9,  [sp, #144]\n"  /* x16=veneer saida, x9=guest TP */
+	"  mrs x9, nzcv\n"
+	"  mrs x10, fpcr\n"
+	"  stp x9, x10,  [sp, #160]\n"
+	"  mrs x9, fpsr\n"
+	"  str x9,       [sp, #176]\n"
+	"  str x19,      [sp, #184]\n"
+	"  stp x20, x21, [sp, #192]\n"
+	"  mov x19, sp\n"              /* guest frame (callee-saved, sobrevive ao C) */
+	"  adrp x10, g_host_tp\n"
 	"  ldr x10, [x10, #:lo12:g_host_tp]\n"
 	"  msr tpidr_el0, x10\n"
-	"  mov x0, sp\n"
-	"  bl pc_do_syscall\n"          /* retorno em x0 (agora com TP do host) */
-	"  ldr x9, [sp, #120]\n"        /* restaura o TP do GUEST */
+	"  adrp x10, g_host_stack\n"
+	"  ldr x10, [x10, #:lo12:g_host_stack]\n"
+	"  mov sp, x10\n"
+	"  mov x0, x19\n"
+	"  bl pc_do_syscall\n"
+	"  str x0, [x19, #208]\n"      /* salva resultado no frame */
+	"  mov sp, x19\n"              /* volta pro guest frame */
+	"  ldr x9, [sp, #152]\n"       /* guest TP */
 	"  msr tpidr_el0, x9\n"
-	"  ldp x11, x12, [sp, #96]\n"   /* restaura NZCV/FPCR/FPSR */
-	"  ldr x13, [sp, #112]\n"
-	"  msr nzcv, x11\n"
-	"  msr fpcr, x12\n"
-	"  msr fpsr, x13\n"
-	"  ldp x6, x7, [sp, #80]\n"
-	"  ldp x17, x30, [sp, #56]\n"
-	"  add sp, sp, #160\n"
-	"  br x17\n"                     /* volta pro guest apos o svc */
+	"  ldp x9, x10, [sp, #160]\n"
+	"  msr nzcv, x9\n"
+	"  msr fpcr, x10\n"
+	"  ldr x9, [sp, #176]\n"
+	"  msr fpsr, x9\n"
+	"  ldr x16, [sp, #144]\n"      /* endereco do veneer de saida */
+	"  ldp x18, x30, [sp, #128]\n"
+	"  ldp x14, x15, [sp, #112]\n"
+	"  ldp x12, x13, [sp, #96]\n"
+	"  ldp x10, x11, [sp, #80]\n"
+	"  ldp x8, x9,   [sp, #64]\n"
+	"  ldp x6, x7,   [sp, #48]\n"
+	"  ldp x4, x5,   [sp, #32]\n"
+	"  ldp x2, x3,   [sp, #16]\n"
+	"  ldp x0, x1,   [sp, #0]\n"
+	"  ldr x19,      [sp, #184]\n"
+	"  ldp x20, x21, [sp, #192]\n"
+	"  ldr x0,       [sp, #208]\n" /* ABI: resultado da syscall em x0 */
+	"  add sp, sp, #224\n"
+	"  br x16\n"                    /* veneer de saida: restaura x16/x17, b site+4 */
 );
 extern void pc_trampoline(void);
 
@@ -111,19 +145,20 @@ static long emulate_brk(long addr)
 	}
 	if (addr == 0)                       /* consulta: retorna break atual */
 		return (long)g_heap_cur;
-	if ((uint8_t *)addr < g_heap_base || (uint8_t *)addr > g_heap_end) {
-		fprintf(stderr, "[brk] RECUSADO addr=0x%lx (heap %p..%p)\n",
-			addr, g_heap_base, g_heap_end);
-		fflush(stderr);
+	if ((uint8_t *)addr < g_heap_base || (uint8_t *)addr > g_heap_end)
 		return (long)g_heap_cur;     /* fora da regiao: recusa (retorna atual) */
-	}
 	g_heap_cur = (uint8_t *)addr;        /* estende/encolhe */
 	return (long)g_heap_cur;
 }
 
+/*
+ * Layout do frame salvo pelo trampolim (offsets em bytes / 8 = indice):
+ *   [0]=x0 [1]=x1 [2]=x2 [3]=x3 [4]=x4 [5]=x5 [6]=x6 [7]=x7 [8]=x8(nr) ...
+ * (x0-x5 args, x8 numero — o frame tem x6/x7 no meio agora, entao nr = regs[8]).
+ */
 long pc_do_syscall(long *regs)
 {
-	long nr = regs[6];
+	long nr = regs[8];               /* x8 = numero da syscall */
 	long params[6] = { regs[0], regs[1], regs[2], regs[3], regs[4], regs[5] };
 	long ret;
 
@@ -273,6 +308,9 @@ int main(int argc, char **argv)
 	lkl_sys_mkdirat(LKL_AT_FDCWD, "/tmp", 0755);
 	lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
 
+	/* PROVADO (4a pesquisa): newfstatat direto do host funciona e sobrevive ->
+	 * LKL e passagem de ponteiro de string do guest estao exonerados. */
+
 	FILE *f = fopen(argv[1], "rb");
 	fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
 	uint8_t *file = malloc(fsz);
@@ -325,15 +363,30 @@ int main(int argc, char **argv)
 
 	for (size_t i = 0; i < (span - VENEER_POOL) / 4; i++) {
 		if (code[i] != SVC0) continue;
-		uint32_t *v = &vpool[vi * 8];       /* 8 words por veneer (32 bytes) */
 		uintptr_t ret_addr = (uintptr_t)&code[i] + 4; /* apos o svc */
 
-		/* veneer: x17=ret_addr (ldr do literal); x16=trampoline; br x16 */
-		v[0] = 0x58000091u; /* ldr x17, #16  -> ret_addr (literal em v[4]) */
-		v[1] = 0x580000B0u; /* ldr x16, #20  -> trampoline (literal em v[6]) */
-		v[2] = 0xD61F0200u; /* br  x16 */
-		v[3] = 0xD503201Fu; /* nop (pad) */
-		*(uint64_t *)&v[4] = (uint64_t)ret_addr;
+		/*
+		 * Veneer de ENTRADA + SAIDA por-site (8 words = 32 bytes):
+		 *  w0 stp x16,x17,[sp,#-16]!   salva x16/x17 ORIGINAIS do guest
+		 *  w1 adr x16, w4              x16 = endereco do veneer de SAIDA
+		 *  w2 ldr x17, w6             x17 = pc_trampoline (literal)
+		 *  w3 br  x17                 entra no trampolim
+		 *  w4 ldp x16,x17,[sp],#16    (SAIDA) restaura x16/x17 do guest
+		 *  w5 b   site+4              branch direto de volta (sem registrador)
+		 *  w6-7 literal pc_trampoline (8 bytes)
+		 * O branch direto em w5 nao precisa de registrador, entao o guest recupera
+		 * x16/x17 intactos — o bug que corrompia args/fluxo apos syscall.
+		 */
+		uint32_t *v = &vpool[vi * 8];
+		uintptr_t w5 = (uintptr_t)&v[5];
+		intptr_t boff = (intptr_t)(ret_addr - w5);   /* site+4 - pc(w5) */
+
+		v[0] = 0xA9BF47F0u; /* stp x16, x17, [sp, #-16]! */
+		v[1] = 0x10000070u; /* adr x16, w4 (+12 bytes) */
+		v[2] = 0x58000091u; /* ldr x17, w6 (+16 bytes) */
+		v[3] = 0xD61F0220u; /* br  x17 */
+		v[4] = 0xA8C147F0u; /* ldp x16, x17, [sp], #16 (veneer de saida) */
+		v[5] = 0x14000000u | (((int32_t)(boff >> 2)) & 0x03FFFFFFu); /* b site+4 */
 		*(uint64_t *)&v[6] = (uint64_t)pc_trampoline;
 
 		/* patch: svc -> b veneer (branch sem link) */
@@ -443,6 +496,16 @@ int main(int argc, char **argv)
 	/* captura o TP do HOST antes de entrar no guest — o trampolim vai restaurar
 	 * este valor sempre que rodar C do host (ver pc_trampoline). */
 	__asm__ volatile("mrs %0, tpidr_el0" : "=r"(g_host_tp));
+
+	/* stack DEDICADO grande pro C do host/LKL (o kernel LKL usa muito stack;
+	 * rodar no stack do guest corrompia memoria). 8MB, alinhado a 16. */
+	{
+		size_t hs = 8 * 1024 * 1024;
+		uint8_t *hstk = mmap(NULL, hs, PROT_READ | PROT_WRITE,
+				     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		g_host_stack = (long)(hstk + hs - 16); /* topo, alinhado */
+		g_host_stack &= ~15L;
+	}
 
 	/* salta pro entry com SP = nosso stack de processo. asm: nao retorna a nao
 	 * ser que o guest faca ret (busybox faz exit-syscall, entao nao volta aqui). */
