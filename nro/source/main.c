@@ -7,7 +7,16 @@
 
 #include <lkl_host.h>
 
-int nx_exec_elf(const char *path); /* nx_exec.c */
+int nx_exec_elf(const char *path);  /* nx_exec.c */
+int nx_exec_argc;                   /* argv do guest, setado antes de nx_exec_elf */
+char **nx_exec_argv;
+
+/* console: o guest (busybox) escreve no fd 1/2 -> aparece na tela via printf.
+ * Chamado pela ponte de syscall (nx_do_syscall). */
+void nx_console_write(const char *s, int len)
+{
+	fwrite(s, 1, len, stdout);
+}
 
 /* marcador de estagio em arquivo: sobrevive a travamento/crash */
 static void stage(const char *s)
@@ -27,11 +36,13 @@ static void stage(const char *s)
  * As threads do kernel so escrevem no buffer de texto via nx_print.
  */
 static int display_stop;
+volatile int nx_display_pause;
 
 static void nx_display_thread(void *arg)
 {
 	while (!display_stop) {
-		consoleUpdate(NULL);
+		if (!nx_display_pause)
+			consoleUpdate(NULL);
 		svcSleepThread(16666666ULL); /* ~60 Hz */
 	}
 }
@@ -107,26 +118,24 @@ static void lkl_main_thread(void *arg)
 		printf("\nlkl_start_kernel() = %d %s\n", ret,
 		       ret == 0 ? "(kernel de pe!)" : "(falhou)");
 
-		/* fase 7: executor de binarios ELF */
-		printf("\n=== Fase 7: executor de binarios ===\n");
+		/* fase 8: executor de binarios ELF — busybox real */
+		printf("\n=== Fase 8: busybox real ===\n");
 		stage("G: antes do executor");
 		lkl_sys_mkdirat(LKL_AT_FDCWD, "/tmp", 0755);
 		lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
-		int xr = nx_exec_elf("sdmc:/lkl-guest.elf");
+		/* reserva fds 0/1/2 no LKL (senao o 1o open do guest pega fd 0=stdin) */
+		for (int r = 0; r < 3; r++)
+			lkl_sys_openat(LKL_AT_FDCWD, "/tmp/.stdio",
+				       LKL_O_RDWR | LKL_O_CREAT, 0644);
+
+		/* argv do busybox: "busybox ls /" */
+		static char *bbargv[] = { "busybox", "ls", "/", NULL };
+		nx_exec_argc = 3;
+		nx_exec_argv = bbargv;
+
+		printf("Rodando: busybox ls /\n\n");
+		int xr = nx_exec_elf("sdmc:/busybox");   /* nao retorna (exit-syscall) */
 		printf("nx_exec_elf = %d\n", xr);
-
-		/* prova: le o arquivo que o GUEST escreveu via nossas syscalls */
-		int gfd = lkl_sys_openat(LKL_AT_FDCWD, "/tmp/guest-out",
-					 LKL_O_RDONLY, 0);
-		if (gfd >= 0) {
-			char gb[64] = {0};
-			long gn = lkl_sys_read(gfd, gb, sizeof(gb) - 1);
-
-			lkl_sys_close(gfd);
-			printf("*** guest escreveu (%ld): %s ***\n", gn, gb);
-		} else {
-			printf("guest-out nao encontrado (%d)\n", gfd);
-		}
 		stage("H: executor retornou");
 	}
 

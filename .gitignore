@@ -20,3 +20,7 @@ nro/source/utils.c
 
 # rascunho/notas internas do post — nao versionar
 GBATEMP_POST.md
+
+# busybox binarios (build via scripts/build-busybox-pie.sh)
+nro/busybox
+nro/busybox-sd
