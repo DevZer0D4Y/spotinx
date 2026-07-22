@@ -17,3 +17,6 @@ nro/source/utils.c
 # artefatos de teste local
 *.o
 *.log
+
+# rascunho/notas internas do post — nao versionar
+GBATEMP_POST.md
