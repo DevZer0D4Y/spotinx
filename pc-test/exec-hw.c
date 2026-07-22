@@ -57,7 +57,7 @@ __asm__(
 	".global pc_trampoline\n"
 	".balign 4\n"
 	"pc_trampoline:\n"
-	"  sub sp, sp, #224\n"
+	"  sub sp, sp, #736\n"          /* 224 GP/estado + 512 SIMD (q0-q31) */
 	"  stp x0, x1,   [sp, #0]\n"
 	"  stp x2, x3,   [sp, #16]\n"
 	"  stp x4, x5,   [sp, #32]\n"
@@ -76,6 +76,24 @@ __asm__(
 	"  str x9,       [sp, #176]\n"
 	"  str x19,      [sp, #184]\n"
 	"  stp x20, x21, [sp, #192]\n"
+	/* SIMD: um svc real preserva TODO q0-q31; uma chamada C (e o fprintf/LKL)
+	 * pode destruir v0-v7,v16-v31 e o topo de v8-v15. Salvamos os 32 completos. */
+	"  stp q0, q1,   [sp, #224]\n"
+	"  stp q2, q3,   [sp, #256]\n"
+	"  stp q4, q5,   [sp, #288]\n"
+	"  stp q6, q7,   [sp, #320]\n"
+	"  stp q8, q9,   [sp, #352]\n"
+	"  stp q10, q11, [sp, #384]\n"
+	"  stp q12, q13, [sp, #416]\n"
+	"  stp q14, q15, [sp, #448]\n"
+	"  stp q16, q17, [sp, #480]\n"
+	"  stp q18, q19, [sp, #512]\n"
+	"  stp q20, q21, [sp, #544]\n"
+	"  stp q22, q23, [sp, #576]\n"
+	"  stp q24, q25, [sp, #608]\n"
+	"  stp q26, q27, [sp, #640]\n"
+	"  stp q28, q29, [sp, #672]\n"
+	"  stp q30, q31, [sp, #704]\n"
 	"  mov x19, sp\n"              /* guest frame (callee-saved, sobrevive ao C) */
 	"  adrp x10, g_host_tp\n"
 	"  ldr x10, [x10, #:lo12:g_host_tp]\n"
@@ -87,6 +105,23 @@ __asm__(
 	"  bl pc_do_syscall\n"
 	"  str x0, [x19, #208]\n"      /* salva resultado no frame */
 	"  mov sp, x19\n"              /* volta pro guest frame */
+	/* restaura SIMD primeiro (usa so o sp) */
+	"  ldp q0, q1,   [sp, #224]\n"
+	"  ldp q2, q3,   [sp, #256]\n"
+	"  ldp q4, q5,   [sp, #288]\n"
+	"  ldp q6, q7,   [sp, #320]\n"
+	"  ldp q8, q9,   [sp, #352]\n"
+	"  ldp q10, q11, [sp, #384]\n"
+	"  ldp q12, q13, [sp, #416]\n"
+	"  ldp q14, q15, [sp, #448]\n"
+	"  ldp q16, q17, [sp, #480]\n"
+	"  ldp q18, q19, [sp, #512]\n"
+	"  ldp q20, q21, [sp, #544]\n"
+	"  ldp q22, q23, [sp, #576]\n"
+	"  ldp q24, q25, [sp, #608]\n"
+	"  ldp q26, q27, [sp, #640]\n"
+	"  ldp q28, q29, [sp, #672]\n"
+	"  ldp q30, q31, [sp, #704]\n"
 	"  ldr x9, [sp, #152]\n"       /* guest TP */
 	"  msr tpidr_el0, x9\n"
 	"  ldp x9, x10, [sp, #160]\n"
@@ -107,7 +142,7 @@ __asm__(
 	"  ldr x19,      [sp, #184]\n"
 	"  ldp x20, x21, [sp, #192]\n"
 	"  ldr x0,       [sp, #208]\n" /* ABI: resultado da syscall em x0 */
-	"  add sp, sp, #224\n"
+	"  add sp, sp, #736\n"
 	"  br x16\n"                    /* veneer de saida: restaura x16/x17, b site+4 */
 );
 extern void pc_trampoline(void);
@@ -183,11 +218,16 @@ long pc_do_syscall(long *regs)
 	if (nr == 29 /*ioctl*/ && (regs[0] == 0 || regs[0] == 1 || regs[0] == 2))
 		return 0;  /* finge sucesso em TCGETS etc (e um tty) */
 
+	/* log de debug controlado por env (DBG=1). Desligado por padrao: mesmo com
+	 * q0-q31 salvos, evitar C/NEON no hot path e a recomendacao (4a/5a pesquisa). */
+	static int dbg = -1;
+	if (dbg < 0) dbg = getenv("DBG") ? 1 : 0;
+	#define TLOG(...) do { if (dbg) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
+
 	/* intercepta syscalls que o LKL nao serve bem no nosso modelo de carga */
 	if (nr == 214) {                     /* brk */
 		ret = emulate_brk(regs[0]);
-		fprintf(stderr, "[trampolim] brk(0x%lx) -> 0x%lx\n", regs[0], ret);
-		fflush(stderr);
+		TLOG("[trampolim] brk(0x%lx) -> 0x%lx\n", regs[0], ret);
 		return ret;
 	}
 	/*
@@ -200,21 +240,18 @@ long pc_do_syscall(long *regs)
 	case 99:  /* set_robust_list */
 	case 293: /* rseq */
 	case 135: /* rt_sigprocmask (se aparecer) */
-		fprintf(stderr, "[trampolim] stub nr=%ld -> 0\n", nr);
-		fflush(stderr);
+		TLOG("[trampolim] stub nr=%ld -> 0\n", nr);
 		return 0;
 	case 222: { /* mmap: emula com memoria REAL do host (anonimo).
 		     * O mmap do LKL retorna endereco do espaco interno dele que o
 		     * guest nao consegue tocar -> emulamos com mmap do host. */
-		long len = regs[1], prot = regs[2], flags = regs[3], gfd = regs[4];
+		long len = regs[1], flags = regs[3], gfd = regs[4];
 		void *m;
 
 		if (gfd == -1 || (flags & 0x20)) { /* MAP_ANONYMOUS */
 			m = mmap(NULL, len, PROT_READ | PROT_WRITE,
 				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			fprintf(stderr, "[trampolim] mmap(len=0x%lx) -> %p\n",
-				len, m);
-			fflush(stderr);
+			TLOG("[trampolim] mmap(len=0x%lx) -> %p\n", len, m);
 			return (m == MAP_FAILED) ? -12 : (long)m;
 		}
 		/* mmap de arquivo: passa pro LKL (raro no ls) */
@@ -223,8 +260,7 @@ long pc_do_syscall(long *regs)
 	}
 
 	ret = lkl_syscall(nr, params);
-	fprintf(stderr, "[trampolim] nr=%ld a0=%ld -> %ld\n", nr, regs[0], ret);
-	fflush(stderr);
+	TLOG("[trampolim] nr=%ld a0=%ld -> %ld\n", nr, regs[0], ret);
 	return ret;
 }
 
