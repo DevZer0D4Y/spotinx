@@ -1,0 +1,19 @@
+# build output
+nro/build/
+nro/*.elf
+nro/*.nro
+nro/*.nacp
+nro/*.map
+nro/lkl-guest.elf
+
+# LKL sources/headers copiados pra dentro do nro no build (regeneraveis)
+nro/include/
+nro/source/iomem.c
+nro/source/iomem.h
+nro/source/jmp_buf.c
+nro/source/jmp_buf.h
+nro/source/utils.c
+
+# artefatos de teste local
+*.o
+*.log
