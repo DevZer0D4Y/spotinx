@@ -460,9 +460,11 @@ int main(int argc, char **argv)
 	 * argv/argstrings do guest = os args passados apos o binario.
 	 */
 	static uint64_t gstack[4096];             /* stack do guest, 32KB */
-	int gargc = argc - 2;                     /* args apos "exec-hw <bin>" */
-	if (gargc < 1) gargc = 1;                 /* ao menos argv0 */
-	char *argv0 = argv[1];                    /* nome do binario */
+	/* guest argv = argv[1..] do exec-hw (argv[1]=nome do bin=guest argv0,
+	 * argv[2..]=args do guest). gargc = argc-1 (tira o "exec-hw"). */
+	int gargc = argc - 1;
+	if (gargc < 1) gargc = 1;
+	char *argv0 = argv[1];                    /* nome do binario = guest argv0 */
 
 	uint64_t *sp = &gstack[2048];             /* comeca no meio, cresce p/ baixo */
 	/*
@@ -543,17 +545,23 @@ int main(int argc, char **argv)
 		g_host_stack &= ~15L;
 	}
 
-	/* salta pro entry com SP = nosso stack de processo. asm: nao retorna a nao
-	 * ser que o guest faca ret (busybox faz exit-syscall, entao nao volta aqui). */
+	/*
+	 * Entra no guest como ENTRADA DE PROCESSO, nao chamada de funcao.
+	 * CRITICO: x0 DEVE ser 0. No aarch64 o _start da glibc trata x0 como
+	 * rtld_fini e o registra via __cxa_atexit se != 0. Um `blr` deixava o SP do
+	 * guest em x0 -> glibc registrava o SP como exit handler -> no exit chamava
+	 * esse endereco (a pilha) -> SIGILL. Zeramos x0 e usamos `br` (entrada de
+	 * processo, binario estatico nao tem interpretador dinamico).
+	 */
 	register uint64_t x_sp __asm__("x9") = (uint64_t)sp;
 	register uint64_t x_en __asm__("x10") = entry;
 	__asm__ volatile(
-		"mov x19, sp\n"      /* preserva nosso sp do host em callee-saved */
 		"mov sp, %0\n"
-		"blr %1\n"
-		"mov sp, x19\n"       /* se o guest retornar, restaura */
+		"mov x0, xzr\n"      /* sem rtld_fini (binario estatico) */
+		"br  %1\n"           /* entrada de processo — nao retorna */
 		: : "r"(x_sp), "r"(x_en)
-		: "x19", "x30", "memory");
+		: "x0", "memory");
+	__builtin_unreachable();
 
 	printf("guest retornou ao host\n"); fflush(stdout);
 	lkl_sys_halt();
