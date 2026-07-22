@@ -20,9 +20,14 @@ LKL=$LKLA/tools/lkl
 ${CROSS}gcc -nostdlib -static-pie -fPIE -ffreestanding -e _start \
     /project/pc-test/guest.c -o /tmp/guest.elf
 
-# executor
+# executor — linkado em endereco ALTO pra nao colidir com o vaddr 0x400000 dos
+# guests EXEC nao-PIE (busybox), que mapeamos com MAP_FIXED la. (artefato do teste
+# no PC; no Switch o Jit nao tem esse conflito.)
 ${CROSS}gcc /project/pc-test/exec-hw.c -I$LKL/include -o /tmp/exec-hw \
-    $LKL/liblkl.a -lpthread -lrt -static 2>&1 | grep -vE 'GNU-stack|deprecated' || true
+    $LKL/liblkl.a -lpthread -lrt -static \
+    -Wl,-Ttext-segment=0x10000000 2>&1 | grep -vE 'GNU-stack|deprecated' || true
 
-echo "=== RUN (qemu-aarch64) ==="
-qemu-aarch64-static /tmp/exec-hw /tmp/guest.elf 2>&1 | grep -vE '^\[' | head -25
+echo "=== RUN guest simples ==="
+qemu-aarch64-static /tmp/exec-hw /tmp/guest.elf 2>&1 | grep -vE '^\[' | head -12
+echo "=== RUN busybox ls / ==="
+timeout 20 qemu-aarch64-static /tmp/exec-hw /work/busybox-a64 ls / 2>&1 | grep -vE '^\[' | head -25
