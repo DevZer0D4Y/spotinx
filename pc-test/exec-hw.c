@@ -259,8 +259,34 @@ long pc_do_syscall(long *regs)
 	}
 	}
 
+	/*
+	 * TRADUCAO DE FLAGS O_*: o guest e aarch64 (O_DIRECTORY=0x4000,
+	 * O_NONBLOCK=0x800, O_CLOEXEC=0x80000...), mas o kernel LKL usa ARCH=lkl /
+	 * asm-generic (valores DIFERENTES). Sem traduzir, openat(dir) da EINVAL.
+	 * Reescrevemos o flags do openat (params[2]) do layout aarch64 -> lkl.
+	 */
+	if (nr == 56) { /* openat: params[2] = flags */
+		long af = params[2], lf = 0;
+		if (af & 03)        lf |= (af & 03);      /* O_RDONLY/WRONLY/RDWR iguais */
+		if (af & 0100)      lf |= 0100;            /* O_CREAT (0x40, igual) */
+		if (af & 0200)      lf |= 0200;            /* O_EXCL */
+		if (af & 01000)     lf |= 01000;           /* O_TRUNC */
+		if (af & 02000)     lf |= 02000;           /* O_APPEND */
+		if (af & 0x800)     lf |= 04000;           /* O_NONBLOCK: 0x800 -> 04000 */
+		if (af & 0x4000)    lf |= 0200000;         /* O_DIRECTORY: 0x4000 -> 0200000 */
+		if (af & 0x8000)    lf |= 0400000;         /* O_NOFOLLOW: 0x8000 -> 0400000 */
+		if (af & 0x80000)   lf |= 02000000;        /* O_CLOEXEC: 0x80000 -> 02000000 */
+		if (af & 0x100000)  lf |= 02000000;        /* (defensivo) */
+		if (af & 0x40000)   lf |= 040000;          /* O_DIRECT: 0x40000 -> 040000 */
+		params[2] = lf;
+	}
+
 	ret = lkl_syscall(nr, params);
-	TLOG("[trampolim] nr=%ld a0=%ld -> %ld\n", nr, regs[0], ret);
+	if (nr == 56 || nr == 79)   /* openat/newfstatat: mostra o path */
+		TLOG("[trampolim] nr=%ld path='%s' flags=0x%lx -> %ld\n",
+		     nr, (char *)regs[1], regs[2], ret);
+	else
+		TLOG("[trampolim] nr=%ld a0=%ld -> %ld\n", nr, regs[0], ret);
 	return ret;
 }
 
@@ -343,6 +369,16 @@ int main(int argc, char **argv)
 	if (lkl_start_kernel("mem=64M loglevel=8")) return 1;
 	lkl_sys_mkdirat(LKL_AT_FDCWD, "/tmp", 0755);
 	lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
+
+	/*
+	 * Reserva os fds 0/1/2 no LKL. Sem isso o 1o open do guest pega fd 0 (=stdin),
+	 * confundindo o guest (busybox: abriu diretorio, recebeu fd 0, fechou stdin).
+	 * Abrimos /tmp/.stdio 3x para ocupar 0,1,2. O console real (write pra tela) e
+	 * interceptado no trampolim, entao esses fds so precisam existir.
+	 */
+	for (int r = 0; r < 3; r++)
+		lkl_sys_openat(LKL_AT_FDCWD, "/tmp/.stdio",
+			       LKL_O_RDWR | LKL_O_CREAT, 0644);
 
 	/* PROVADO (4a pesquisa): newfstatat direto do host funciona e sobrevive ->
 	 * LKL e passagem de ponteiro de string do guest estao exonerados. */
