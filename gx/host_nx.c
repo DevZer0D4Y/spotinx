@@ -1,0 +1,1713 @@
+/*
+ * host_nx.c - the host layer and entry point for Horizon (Nintendo Switch,
+ * libnx). The LKL host operations are the ones of nro/source/nx_host.c.
+ *
+ * On the SD card:
+ *   sdmc:/gx/sysroot/      copied to the root of the LKL filesystem
+ *   sdmc:/gx/programs.txt  one command per line, offered as a menu, under the
+ *                          name in brackets if it starts with one. Before the
+ *                          program: -t traces the guest's syscalls, -b gives
+ *                          a headless Chromium the screen and the controls
+ *                          (cdp.c; the keys are at host_input()), @<image>
+ *                          takes an ext4 image of sdmc:/gx as the root instead
+ *                          of the sysroot, ><file> copies a guest file to
+ *                          sdmc:/gx when the guest exits
+ *   sdmc:/gx/gx.log        everything gx and the guest print
+ *
+ * The screen is the text console until the guest creates an EGL window
+ * surface, which takes the screen over; the console comes back when the guest
+ * calls eglTerminate(). Meanwhile text only goes to the log.
+ *
+ * Guest memory. Horizon has no mmap: the only way to put memory at an address
+ * of our choosing, and the only memory that can be made executable, is "code
+ * memory", an alias of heap pages (svcMapProcessCodeMemory). So the arena is
+ * a reserved range of addresses, and committing pages maps pages of a pool
+ * taken from the heap. Protections follow the kernel's rules:
+ *   - never writable and executable at once;
+ *   - a page stays "code" (None, R or RX at will) until it is made writable,
+ *     which turns it into "data" (None, R or RW at will) for good;
+ *   - a data page becomes code again only by unmapping and remapping it,
+ *     which keeps its contents but leaves a short window without the page.
+ */
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <malloc.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <switch.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <png.h>
+#include <turbojpeg.h>
+#include <lkl.h>
+#include <lkl_host.h>
+#include "gx.h"
+#include "nat.h"
+#include "cdp.h"
+
+#define GX_DIR "sdmc:/gx"
+#define KERNEL_ARGS "mem=192M loglevel=4"
+/* Left to malloc for stacks, libnx and the GPU driver; less when the homebrew
+ * runs as an applet and the whole heap is a few hundred megabytes. */
+#define HEAP_KEPT (256UL << 20)
+#define HEAP_KEPT_SMALL (48UL << 20)
+#define POOL_WORTH_IT (192UL << 20)
+/* Host functions called for the guest (the GL driver) run on these too. */
+#define MAIN_STACK (4UL << 20)
+#define THREAD_STACK (1UL << 20)
+/* The only priority Horizon time-slices: guest threads may spin. */
+#define GUEST_PRIO 0x3B
+
+static Mutex print_lock, mem_lock, screen_lock;
+static FILE *log_file;
+static volatile int finished;
+static volatile int console_on = 1;   /* changed under screen_lock */
+
+/*
+ * The console and whoever takes the screen from it. The console draws under
+ * screen_lock, and only under it: when libnx fails to get a buffer to draw in
+ * (which happens, for a reason still unknown), the thread that draws stops
+ * for good inside libnx, lock in hand, and nothing else may depend on it.
+ */
+static void console_off(void)
+{
+	int locked = 0;
+
+	for (int i = 0; i < 50 && !(locked = mutexTryLock(&screen_lock)); i++)
+		svcSleepThread(10000000ULL);
+	if (!locked) {
+		/* The thread that draws is stuck: take the window as it is. */
+		console_on = 0;
+		nwindowReleaseBuffers(nwindowGetDefault());
+		return;
+	}
+	if (console_on) {
+		console_on = 0;
+		consoleExit(NULL);
+	}
+	mutexUnlock(&screen_lock);
+}
+
+static void console_back(void)
+{
+	if (!mutexTryLock(&screen_lock))
+		return;
+	if (!console_on) {
+		consoleInit(NULL);
+		console_on = 1;
+	}
+	mutexUnlock(&screen_lock);
+}
+
+/* ---------- console, logging ---------- */
+
+void host_console_write(int fd, const void *buf, size_t len)
+{
+	mutexLock(&print_lock);
+	if (console_on)
+		fwrite(buf, 1, len, stdout);
+	if (log_file) {
+		static u64 synced;
+		u64 now = armGetSystemTick();
+
+		fwrite(buf, 1, len, log_file);
+		fflush(log_file);
+		/* What is not committed to the card is lost if the console is
+		 * switched off or the program is killed. */
+		if (armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
+			fsync(fileno(log_file));
+			synced = now;
+		}
+	}
+	mutexUnlock(&print_lock);
+}
+
+static void sync_log(void)
+{
+	mutexLock(&print_lock);
+	if (log_file)
+		fsync(fileno(log_file));
+	mutexUnlock(&print_lock);
+}
+
+void host_log(const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n > (int)sizeof(buf) - 1)
+		n = sizeof(buf) - 1;
+	host_console_write(2, buf, n);
+}
+
+/* ---------- memory ---------- */
+
+#define PG_MAPPED 0x80
+#define PG_DATA 0x40   /* was made writable: no longer "code" for the kernel */
+/* The protection the kernel has for the page, which it wants uniform over
+ * the range of a call; a page just mapped has one of its own. */
+#define PG_PERM 0x07
+enum { P_FRESH, P_NONE, P_R, P_RW, P_RX };
+
+static uint8_t *arena;
+static size_t shared_budget;   /* what __libnx_initheap() left out of the heap */
+/* What is known of each arena page, in leaves made as the arena fills: it is
+ * tens of gigabytes of addresses, nearly all of them never used. */
+#define LEAF_PAGES 1024
+struct leaf {
+	uint32_t src[LEAF_PAGES];      /* pool page behind each arena page */
+	uint8_t flags[LEAF_PAGES];
+};
+static struct leaf **leaves;
+
+static uint8_t flags_at(size_t p)
+{
+	struct leaf *l = leaves[p / LEAF_PAGES];
+
+	return l ? l->flags[p % LEAF_PAGES] : 0;
+}
+
+static uint32_t src_at(size_t p)
+{
+	struct leaf *l = leaves[p / LEAF_PAGES];
+
+	return l ? l->src[p % LEAF_PAGES] : 0;
+}
+
+static void set_flags(size_t p, size_t n, uint8_t flags)
+{
+	for (; n; p++, n--)
+		if (leaves[p / LEAF_PAGES])
+			leaves[p / LEAF_PAGES]->flags[p % LEAF_PAGES] = flags;
+}
+
+static int set_page(size_t p, uint32_t src, uint8_t flags)
+{
+	struct leaf **l = &leaves[p / LEAF_PAGES];
+
+	if (!*l && !(*l = calloc(1, sizeof(**l))))
+		return -1;
+	(*l)->src[p % LEAF_PAGES] = src;
+	(*l)->flags[p % LEAF_PAGES] = flags;
+	return 0;
+}
+static uint8_t *pool, *pool_used;
+static size_t pool_pages, pool_hint, pool_free;
+static Handle self;
+
+/*
+ * Where the arena goes. The address space of the process is 512 GB with a
+ * Homebrew Loader that asks for 39 bits (64 GB otherwise), but the kernel puts
+ * the regions it keeps for the heap, the stacks and its aliases anywhere in
+ * it, and things are mapped here and there: no single free run is sure to be
+ * large enough for a program like Chromium. So the arena is a window of the
+ * address space, the one with the most free addresses in it, and what is not
+ * free in the window is reported to the core as holes.
+ */
+#define MAX_SPANS 64
+#define SPAN_MARGIN (16UL << 20)   /* left free around what others mapped */
+#define SPAN_MIN (256UL << 20)
+
+static struct span {
+	u64 start, end;
+} spans[MAX_SPANS];                /* the free runs of the window, in order */
+static int span_count;
+static u64 window_start, window_end;
+
+/* Lists the free runs of the address space where code memory may go. */
+static void find_spans(void)
+{
+	enum { ALIAS, HEAP, STACK, ASLR, REGIONS };
+	static const InfoType types[REGIONS][2] = {
+		{ InfoType_AliasRegionAddress, InfoType_AliasRegionSize },
+		{ InfoType_HeapRegionAddress, InfoType_HeapRegionSize },
+		{ InfoType_StackRegionAddress, InfoType_StackRegionSize },
+		{ InfoType_AslrRegionAddress, InfoType_AslrRegionSize },
+	};
+	u64 start[REGIONS] = { 0 }, len[REGIONS] = { 0 };
+	u64 addr, end;
+
+	for (int i = 0; i < REGIONS; i++) {
+		svcGetInfo(&start[i], types[i][0], CUR_PROCESS_HANDLE, 0);
+		svcGetInfo(&len[i], types[i][1], CUR_PROCESS_HANDLE, 0);
+	}
+	addr = start[ASLR];
+	end = start[ASLR] + len[ASLR];
+	while (addr < end) {
+		MemoryInfo info;
+		u32 page_info;
+		u64 from, to;
+
+		if (R_FAILED(svcQueryMemory(&info, &page_info, addr)) || !info.size)
+			break;
+		from = addr;
+		to = info.addr + info.size < end ? info.addr + info.size : end;
+		addr = info.addr + info.size;
+		if (info.type != MemType_Unmapped)
+			continue;
+		/* The free block, cut at each region it runs into. */
+		while (from < to) {
+			u64 stop = to, next = to, lo, hi;
+
+			for (int i = 0; i < ASLR; i++) {
+				if (from >= start[i] && from < start[i] + len[i]) {
+					stop = from;              /* inside one: skip it */
+					next = start[i] + len[i];
+				} else if (start[i] > from && start[i] < stop) {
+					stop = start[i];
+					next = start[i] + len[i];
+				}
+			}
+			lo = (from + SPAN_MARGIN + 0x1fffff) & ~0x1fffffUL;
+			hi = stop > SPAN_MARGIN ? (stop - SPAN_MARGIN) & ~0x1fffffUL : 0;
+			if (hi > lo && hi - lo >= SPAN_MIN && span_count < MAX_SPANS) {
+				spans[span_count].start = lo;
+				spans[span_count].end = hi;
+				span_count++;
+			}
+			from = next > from ? next : to;
+		}
+	}
+}
+
+/* Keeps the window of at most len bytes with the most free addresses. */
+static void choose_window(u64 len)
+{
+	u64 best = 0, best_start = 0, total = 0;
+	int kept = 0;
+
+	for (int i = 0; i < span_count; i++) {
+		u64 free_bytes = 0;
+
+		for (int k = i; k < span_count && spans[k].start < spans[i].start + len; k++)
+			free_bytes += (spans[k].end < spans[i].start + len ? spans[k].end
+									   : spans[i].start + len) -
+				      spans[k].start;
+		if (free_bytes > best) {
+			best = free_bytes;
+			best_start = spans[i].start;
+		}
+	}
+	window_start = best_start;
+	window_end = best_start;
+	for (int i = 0; i < span_count; i++) {
+		if (spans[i].start < best_start || spans[i].start >= best_start + len)
+			continue;
+		spans[kept] = spans[i];
+		if (spans[kept].end > best_start + len)
+			spans[kept].end = best_start + len;
+		window_end = spans[kept].end;
+		total += spans[kept].end - spans[kept].start;
+		kept++;
+	}
+	span_count = kept;
+	host_log("gx: %lu GB of addresses free in %d runs, between %#lx and %#lx\n",
+		 (unsigned long)(total >> 30), span_count, (unsigned long)window_start,
+		 (unsigned long)window_end);
+}
+
+/* The holes are what lies between the free runs of the window. */
+int host_reserved_hole(int index, void **addr, size_t *len)
+{
+	if (index + 1 >= span_count)
+		return 0;
+	*addr = (void *)spans[index].end;
+	*len = spans[index + 1].start - spans[index].end;
+	return 1;
+}
+
+void *host_reserve(size_t *len)
+{
+	size_t size = 0, kept = HEAP_KEPT;
+	void *addr;
+
+	find_spans();
+	choose_window(*len);
+	if (!span_count)
+		return NULL;
+	/* So that libnx maps nothing of its own where the guest will be. */
+	virtmemLock();
+	for (int i = 0; i < span_count; i++)
+		virtmemAddReservation((void *)spans[i].start, spans[i].end - spans[i].start);
+	virtmemUnlock();
+	addr = (void *)window_start;
+	*len = window_end - window_start;
+	arena = addr;
+	leaves = calloc(*len / GX_PAGE / LEAF_PAGES + 1, sizeof(*leaves));
+
+	/* The pool is all the heap but what the host keeps for itself. */
+	while (!pool) {
+		for (size = 3072UL << 20; size >= (32UL << 20); size -= 16UL << 20) {
+			void *probe = memalign(GX_PAGE, size + kept);
+
+			if (probe) {
+				free(probe);
+				break;
+			}
+		}
+		if (size < POOL_WORTH_IT && kept != HEAP_KEPT_SMALL) {
+			kept = HEAP_KEPT_SMALL;
+			continue;
+		}
+		if (size < (32UL << 20))
+			break;
+		pool = memalign(GX_PAGE, size);
+		if (!pool)
+			break;
+	}
+	if (!leaves || !pool) {
+		host_log("gx: not enough memory for the guest\n");
+		return NULL;
+	}
+	pool_pages = pool_free = size / GX_PAGE;
+	pool_used = calloc(pool_pages, 1);
+	if (!pool_used)
+		return NULL;
+	self = envGetOwnProcessHandle();
+	host_log("gx: %lu MB for the guest, %lu MB for shared memory\n",
+		 (unsigned long)(size >> 20), (unsigned long)(shared_budget >> 20));
+	return addr;
+}
+
+static size_t page_of(void *addr) { return ((uint8_t *)addr - arena) / GX_PAGE; }
+
+/* Finds free pool pages, n at most and in one piece: the first run found. */
+static size_t pool_take(size_t n, size_t *first)
+{
+	for (int pass = 0; pass < 2; pass++) {
+		for (size_t p = pass ? 0 : pool_hint; p < pool_pages; p++) {
+			size_t run = 0;
+
+			if (pool_used[p])
+				continue;
+			while (run < n && p + run < pool_pages && !pool_used[p + run])
+				run++;
+			memset(&pool_used[p], 1, run);
+			pool_free -= run;
+			pool_hint = p + run;
+			*first = p;
+			return run;
+		}
+	}
+	return 0;
+}
+
+static void pool_give(size_t first, size_t n)
+{
+	memset(&pool_used[first], 0, n);
+	pool_free += n;
+	if (first < pool_hint)
+		pool_hint = first;
+}
+
+/* The pages from p on that share flags and are backed by consecutive pool
+ * pages, n at most: what one call to the kernel can cover. */
+static size_t run_of(size_t p, size_t n)
+{
+	size_t run = 1;
+
+	while (run < n && flags_at(p + run) == flags_at(p) &&
+	       src_at(p + run) == src_at(p) + run)
+		run++;
+	return run;
+}
+
+static int unmap_pages(size_t p, size_t n)
+{
+	while (n) {
+		size_t run;
+		Result rc;
+
+		if (!(flags_at(p) & PG_MAPPED)) {
+			p++;
+			n--;
+			continue;
+		}
+		run = run_of(p, n);
+		rc = svcUnmapProcessCodeMemory(self, (u64)(arena + p * GX_PAGE),
+					       (u64)(pool + (u64)src_at(p) * GX_PAGE),
+					       run * GX_PAGE);
+		if (R_FAILED(rc)) {
+			host_log("gx: unmap of %p failed (%#x)\n", arena + p * GX_PAGE, rc);
+			return -1;
+		}
+		pool_give(src_at(p), run);
+		set_flags(p, run, 0);
+		p += run;
+		n -= run;
+	}
+	return 0;
+}
+
+static int set_protection(size_t p, size_t n, int prot)
+{
+	int write = prot & GX_PROT_WRITE, exec = prot & GX_PROT_EXEC;
+	u32 perm = write ? Perm_Rw : exec ? Perm_Rx : (prot & GX_PROT_READ) ? Perm_R : Perm_None;
+	uint8_t code = write ? P_RW : exec ? P_RX : (prot & GX_PROT_READ) ? P_R : P_NONE;
+
+	if (write && exec)
+		return -1;
+	while (n) {
+		size_t run = run_of(p, n);
+		u64 addr = (u64)(arena + p * GX_PAGE), len = run * GX_PAGE;
+		u64 src = (u64)(pool + (u64)src_at(p) * GX_PAGE);
+		Result rc;
+
+		if (!(flags_at(p) & PG_MAPPED))
+			return -1;
+		if ((flags_at(p) & PG_PERM) == code) {
+			rc = 0;
+		} else if (!(flags_at(p) & PG_DATA)) {
+			rc = svcSetProcessMemoryPermission(self, addr, len, perm);
+			if (R_SUCCEEDED(rc))
+				set_flags(p, run, PG_MAPPED | (write ? PG_DATA : 0) | code);
+		} else if (!exec) {
+			rc = svcSetMemoryPermission((void *)addr, len, perm);
+			if (R_SUCCEEDED(rc))
+				set_flags(p, run, PG_MAPPED | PG_DATA | code);
+		} else {
+			/* Data to code: only a fresh mapping is code again. */
+			rc = svcUnmapProcessCodeMemory(self, addr, src, len);
+			if (R_SUCCEEDED(rc))
+				rc = svcMapProcessCodeMemory(self, addr, src, len);
+			if (R_SUCCEEDED(rc)) {
+				set_flags(p, run, PG_MAPPED | P_FRESH);
+				rc = svcSetProcessMemoryPermission(self, addr, len, perm);
+			}
+			if (R_SUCCEEDED(rc))
+				set_flags(p, run, PG_MAPPED | code);
+		}
+		if (R_FAILED(rc)) {
+			host_log("gx: protection %d of %p+%#lx failed (%#x)\n", prot,
+				 (void *)addr, (unsigned long)len, rc);
+			return -1;
+		}
+		p += run;
+		n -= run;
+	}
+	return 0;
+}
+
+int host_commit(void *addr, size_t len, int prot)
+{
+	size_t first = page_of(addr), n = len / GX_PAGE, done = 0;
+	int ret = 0;
+
+	mutexLock(&mem_lock);
+	if (n > pool_free) {
+		host_log("gx: out of guest memory (%lu KB asked, %lu KB left)\n",
+			 (unsigned long)(len >> 10), (unsigned long)(pool_free * 4));
+		ret = -1;
+	}
+	while (!ret && done < n) {
+		size_t src = 0, run = pool_take(n - done, &src);
+		Result rc;
+
+		/* The pool is ordinary memory until it is mapped: zero it here. */
+		memset(pool + src * GX_PAGE, 0, run * GX_PAGE);
+		rc = svcMapProcessCodeMemory(self, (u64)addr + done * GX_PAGE,
+					     (u64)(pool + src * GX_PAGE), run * GX_PAGE);
+		if (R_FAILED(rc)) {
+			host_log("gx: map of %p failed (%#x)\n", (uint8_t *)addr + done * GX_PAGE, rc);
+			pool_give(src, run);
+			ret = -1;
+			break;
+		}
+		for (size_t i = 0; i < run; i++) {
+			set_page(first + done + i, src + i, PG_MAPPED | P_FRESH);
+		}
+		done += run;
+	}
+	if (!ret)
+		ret = set_protection(first, n, prot);
+	if (ret)
+		unmap_pages(first, done);
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+
+int host_protect(void *addr, size_t len, int prot)
+{
+	int ret;
+
+	mutexLock(&mem_lock);
+	ret = set_protection(page_of(addr), len / GX_PAGE, prot);
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+
+int host_decommit(void *addr, size_t len)
+{
+	int ret;
+
+	mutexLock(&mem_lock);
+	ret = unmap_pages(page_of(addr), len / GX_PAGE);
+	mutexUnlock(&mem_lock);
+	return ret;
+}
+
+/*
+ * Shared memory is the kernel's, the one kind of memory it maps at several
+ * addresses of a process. It does not come out of the heap but out of what
+ * the process has not claimed, and the Homebrew Menu claims everything for
+ * the heap: __libnx_initheap() below gives some back.
+ */
+#define MAX_SHARED_HANDLES 512
+static Handle shared_handles[MAX_SHARED_HANDLES];
+
+/* The kernel has 80 shared memory objects for the whole console, and the
+ * system uses some: Chromium alone makes fifty small ones. */
+size_t host_shared_chunk(void) { return 16UL << 20; }
+
+int host_shared_new(size_t len)
+{
+	int slot = -1;
+
+	if (!shared_budget)
+		return -1;
+	mutexLock(&mem_lock);
+	for (int i = 0; i < MAX_SHARED_HANDLES && slot < 0; i++)
+		if (!shared_handles[i])
+			slot = i;
+	if (slot >= 0) {
+		Result rc = svcCreateSharedMemory(&shared_handles[slot], len, Perm_Rw, Perm_Rw);
+
+		if (R_FAILED(rc)) {
+			host_log("gx: no shared memory of %lu KB (%#x)\n", (unsigned long)(len >> 10), rc);
+			shared_handles[slot] = 0;
+			slot = -1;
+		}
+	}
+	mutexUnlock(&mem_lock);
+	return slot;
+}
+
+int host_shared_map(int handle, void *addr, size_t len, int prot)
+{
+	Result rc;
+
+	/* Always as it was created: the kernel refuses its owner any other
+	 * permission, so a read-only view is only read-only by convention.
+	 * Under the lock like every change to the address space: the console
+	 * has been seen to fail to draw (twice, in runs that mapped shared
+	 * memory) and it only draws with this lock held. */
+	mutexLock(&mem_lock);
+	rc = svcMapSharedMemory(shared_handles[handle], addr, len, Perm_Rw);
+	mutexUnlock(&mem_lock);
+
+	if (R_FAILED(rc))
+		host_log("gx: cannot map shared memory at %p (%#x)\n", addr, rc);
+	return R_FAILED(rc) ? -1 : 0;
+}
+
+void host_shared_unmap(int handle, void *addr, size_t len)
+{
+	mutexLock(&mem_lock);
+	svcUnmapSharedMemory(shared_handles[handle], addr, len);
+	mutexUnlock(&mem_lock);
+}
+
+void host_shared_free(int handle)
+{
+	svcCloseHandle(shared_handles[handle]);
+	shared_handles[handle] = 0;
+}
+
+/* Replaces libnx's: the heap the Homebrew Menu hands over is all the memory
+ * there is, and its top goes back to the system for shared memory. Leaving
+ * through the Homebrew Menu is no longer possible after that (it believes the
+ * heap is whole), which is why gx always ends the process. */
+#define SHARED_BUDGET (384UL << 20)
+#define HEAP_WORTH_SHARING (1UL << 30)
+
+void __libnx_initheap(void)
+{
+	extern char *fake_heap_start, *fake_heap_end;
+	u64 region = 0, total;
+	void *addr = NULL;
+	size_t size;
+
+	if (envHasHeapOverride()) {
+		addr = envGetHeapOverrideAddr();
+		size = envGetHeapOverrideSize();
+		svcGetInfo(&region, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
+		total = (u64)addr + size - region;
+		/* Only when the numbers are what a heap looks like. */
+		if (size >= HEAP_WORTH_SHARING && region && region <= (u64)addr &&
+		    !(total & 0x1fffff)) {
+			void *base;
+
+			if (R_SUCCEEDED(svcSetHeapSize(&base, total - SHARED_BUDGET))) {
+				size -= SHARED_BUDGET;
+				shared_budget = SHARED_BUDGET;
+			}
+		}
+	} else {
+		u64 available = 0, used = 0;
+
+		svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+		svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+		size = available > used + 0x200000 ? (available - used - 0x200000) & ~0x1fffffUL : 0;
+		if (size >= HEAP_WORTH_SHARING) {
+			size -= SHARED_BUDGET;
+			shared_budget = SHARED_BUDGET;
+		}
+		if (!size)
+			size = 0x2000000 * 16;
+		if (R_FAILED(svcSetHeapSize(&addr, size)))
+			diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
+	}
+	fake_heap_start = addr;
+	fake_heap_end = (char *)addr + size;
+}
+
+void host_flush_icache(void *addr, size_t len)
+{
+	/* The kernel flushes the instruction cache when it makes pages
+	 * executable, which is the only way code appears here. */
+}
+
+/* ---------- threads ---------- */
+
+struct start {
+	Thread thread;
+	void (*fn)(void *);
+	void *arg;
+};
+
+static int next_core;
+
+static void thread_start(void *p)
+{
+	struct start *s = p;
+
+	s->fn(s->arg);
+}
+
+static int start_thread(void (*fn)(void *), void *arg, size_t stack)
+{
+	struct start *s = malloc(sizeof(*s));   /* lives as long as the thread */
+	int core = __atomic_fetch_add(&next_core, 1, __ATOMIC_RELAXED) % 3;
+	Result rc;
+
+	if (!s)
+		return -1;
+	s->fn = fn;
+	s->arg = arg;
+	rc = threadCreate(&s->thread, thread_start, s, NULL, stack, GUEST_PRIO, core);
+	if (R_SUCCEEDED(rc)) {
+		/* It starts on its core but may run on any of the three: a thread
+		 * tied to one core waits for the others tied to it, a time slice
+		 * at a time, while the other cores sit idle (Chromium ran at 28
+		 * frames a second with no thread above 40% of a processor). */
+		svcSetThreadCoreMask(s->thread.handle, core, 0x7);
+		rc = threadStart(&s->thread);
+		if (R_FAILED(rc))
+			threadClose(&s->thread);
+	}
+	if (R_FAILED(rc)) {
+		host_log("gx: cannot start a thread (%#x)\n", rc);
+		free(s);
+		return -1;
+	}
+	return 0;
+}
+
+int host_thread_start(void (*fn)(void *), void *arg)
+{
+	return start_thread(fn, arg, THREAD_STACK);
+}
+
+void host_thread_exit(void)
+{
+	threadExit();
+	__builtin_unreachable();
+}
+
+void host_yield(void) { svcSleepThread(YieldType_WithCoreMigration); }
+
+uint64_t host_thread_self(void) { return threadGetCurHandle(); }
+
+uint64_t host_thread_cpu_ns(uint64_t thread)
+{
+	u64 ticks = 0;
+
+	/* On every core (-1). */
+	if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, (Handle)thread, (u64)-1)))
+		return 0;
+	return armTicksToNs(ticks);
+}
+
+static void export_file(void);
+
+void host_exit(int code)
+{
+	export_file();
+	gmem_report();
+	host_log("\ngx: the program exited with code %d. Press + to quit.\n", code);
+	sync_log();
+	finished = 1;
+	/* Other guest threads are left alone: Horizon cannot stop them, and
+	 * quitting ends the whole process. */
+	for (;;)
+		svcSleepThread(1000000000ULL);
+}
+
+struct host_lock { Mutex m; };
+struct host_cond { CondVar c; };
+
+struct host_lock *host_lock_new(void)
+{
+	struct host_lock *l = malloc(sizeof(*l));
+
+	mutexInit(&l->m);
+	return l;
+}
+
+void host_lock_acquire(struct host_lock *l) { mutexLock(&l->m); }
+void host_lock_release(struct host_lock *l) { mutexUnlock(&l->m); }
+
+struct host_cond *host_cond_new(void)
+{
+	struct host_cond *c = malloc(sizeof(*c));
+
+	condvarInit(&c->c);
+	return c;
+}
+
+int host_cond_wait(struct host_cond *c, struct host_lock *l, int64_t ns)
+{
+	if (ns < 0) {
+		condvarWait(&c->c, &l->m);
+		return 0;
+	}
+	return R_FAILED(condvarWaitTimeout(&c->c, &l->m, ns));
+}
+
+void host_cond_signal(struct host_cond *c) { condvarWakeOne(&c->c); }
+
+/* ---------- the rest of the host interface ---------- */
+
+void host_random(void *buf, size_t len) { randomGet(buf, len); }
+
+uint64_t host_now_ns(void) { return armTicksToNs(armGetSystemTick()); }
+
+uint64_t host_hwcap(int which)
+{
+	/* The Cortex-A57 of the Switch: fp, asimd, aes, pmull, sha1, sha2, crc32. */
+	return which ? 0 : 0xfb;
+}
+
+/* ---------- host functions for the guest: EGL and GLES ---------- */
+
+/* Every EGL and GLES function of the libraries linked in (Mesa), made by
+ * build-nx.sh: there is no dlsym() here. */
+extern const struct gx_gl_entry {
+	const char *name;
+	void (*fn)(void);
+} gx_gl_table[];
+
+static EGLDisplay gl_get_display(void *native)
+{
+	return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+}
+
+static EGLDisplay gl_get_platform_display(EGLenum platform, void *native, const EGLAttrib *attribs)
+{
+	return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+}
+
+static EGLSurface window_surface = EGL_NO_SURFACE;
+
+/* The guest's window is the screen, which the console gives up. */
+static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
+					   const void *attribs)
+{
+	console_off();
+	window_surface = eglCreateWindowSurface(dpy, config, nwindowGetDefault(), NULL);
+	return window_surface;
+}
+
+/* Mesa on the Switch says a window surface is 0 by 0 (seen on hardware, at
+ * least before the first frame); the window knows better. */
+static EGLBoolean gl_query_surface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
+				   EGLint *value)
+{
+	EGLBoolean ret = eglQuerySurface(dpy, surface, attribute, value);
+	u32 width = 0, height = 0;
+
+	if (ret && value && *value <= 0 && surface == window_surface &&
+	    (attribute == EGL_WIDTH || attribute == EGL_HEIGHT) &&
+	    R_SUCCEEDED(nwindowGetDimensions(nwindowGetDefault(), &width, &height)))
+		*value = attribute == EGL_WIDTH ? width : height;
+	return ret;
+}
+
+static EGLBoolean gl_terminate(EGLDisplay dpy)
+{
+	EGLBoolean ret = eglTerminate(dpy);
+
+	console_back();
+	return ret;
+}
+
+void *host_symbol(const char *name)
+{
+	static const struct {
+		const char *name;
+		void *fn;
+	} ours[] = {
+		{ "eglGetDisplay", gl_get_display },
+		{ "eglGetPlatformDisplay", gl_get_platform_display },
+		{ "eglGetPlatformDisplayEXT", gl_get_platform_display },
+		{ "eglCreateWindowSurface", gl_create_window_surface },
+		{ "eglCreatePlatformWindowSurface", gl_create_window_surface },
+		{ "eglCreatePlatformWindowSurfaceEXT", gl_create_window_surface },
+		{ "eglQuerySurface", gl_query_surface },
+		{ "eglTerminate", gl_terminate },
+	};
+
+	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
+		return NULL;
+	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
+		if (!strcmp(name, ours[i].name))
+			return ours[i].fn;
+	for (const struct gx_gl_entry *e = gx_gl_table; e->name; e++)
+		if (!strcmp(name, e->name))
+			return (void *)e->fn;
+	return (void *)eglGetProcAddress(name);
+}
+
+/* ---------- network ---------- */
+
+
+/* The device has to exist before the kernel starts. Returns its id, or a
+ * negative value: the guest then runs without a network. */
+static int net_add(void)
+{
+	u32 addr = 0, mask = 0, gateway = 0, dns = 0, dns2 = 0;
+	struct lkl_netdev_args args;
+	struct lkl_netdev *nd;
+	static uint8_t mac[6];
+	int id;
+
+	if (R_FAILED(socketInitializeDefault())) {
+		host_log("gx: no sockets, no network\n");
+		return -1;
+	}
+	if (R_SUCCEEDED(nifmInitialize(NifmServiceType_User))) {
+		nifmGetCurrentIpConfigInfo(&addr, &mask, &gateway, &dns, &dns2);
+		nifmExit();
+	}
+	if (!dns)
+		dns = inet_addr("1.1.1.1");
+	nd = nat_create(dns, mac);
+	memset(&args, 0, sizeof(args));
+	args.mac = mac;
+	id = nd ? lkl_netdev_add(nd, &args) : -1;
+	host_log("gx: network device %d, resolver %s\n", id, inet_ntoa((struct in_addr){ dns }));
+	return id;
+}
+
+static void net_up(int id)
+{
+	int ifindex = lkl_netdev_get_ifindex(id);
+	int ret = ifindex < 0 ? ifindex : lkl_if_up(ifindex);
+
+	lkl_if_up(1); /* lo */
+	if (!ret)
+		ret = lkl_if_set_ipv4(ifindex, htonl(NAT_GUEST), NAT_PREFIX);
+	if (!ret)
+		ret = lkl_set_ipv4_gateway(htonl(NAT_GATEWAY));
+	if (ret)
+		host_log("gx: cannot configure the network (%d)\n", ret);
+}
+
+/* ---------- crash report ---------- */
+
+extern char _start[];   /* the first instruction of the NRO (libnx's crt0) */
+
+alignas(16) u8 __nx_exception_stack[0x8000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+static void report_address(const char *label, uint64_t addr)
+{
+	uint64_t base = 0;
+	int kind = gmem_describe(addr, &base);
+
+	if (kind == 2)
+		host_log("  %s %#lx (image at %#lx, offset %#lx)\n", label, (unsigned long)addr,
+			 (unsigned long)base, (unsigned long)(addr - base));
+	else
+		host_log("  %s %#lx (%s)\n", label, (unsigned long)addr,
+			 kind ? "guest memory" : "host");
+}
+
+/* Runs on the faulting thread, which never leaves: the screen and the log
+ * stay readable until + is pressed. */
+void __libnx_exception_handler(ThreadExceptionDump *ctx)
+{
+	static int reported;
+
+	if (!__atomic_exchange_n(&reported, 1, __ATOMIC_SEQ_CST)) {
+		/* The thread may have died holding the lock; do without it then. */
+		if (!mutexTryLock(&print_lock))
+			mutexInit(&print_lock);
+		else
+			mutexUnlock(&print_lock);
+		host_log("\ngx: fault, exception %#x%s\n", ctx->error_desc,
+			 gmem_describe(ctx->pc.x, &(uint64_t){ 0 }) ? "" : " in the host");
+		/* For addresses in the host: gx.map has them from this base. */
+		host_log("  gx is loaded at %p\n", _start);
+		report_address("pc ", ctx->pc.x);
+		report_address("lr ", ctx->lr.x);
+		host_log("  far %#lx\n  sp  %#lx\n", (unsigned long)ctx->far.x, (unsigned long)ctx->sp.x);
+		for (int i = 0; i < 9; i++)
+			host_log("  x%d  %#lx\n", i, (unsigned long)ctx->cpu_gprs[i].x);
+		host_log("Press + to quit.\n");
+		sync_log();
+		finished = 1;
+	}
+	for (;;)
+		svcSleepThread(1000000000ULL);
+}
+
+/* ---------- the root filesystem ---------- */
+
+/* An ext4 image on the SD card as a disk of the kernel: what a root too big
+ * to copy into memory needs. Read-only. */
+static struct lkl_disk root_disk;
+static FILE *root_image;
+static Mutex root_lock;
+
+static int image_capacity(struct lkl_disk disk, unsigned long long *res)
+{
+	fseeko(root_image, 0, SEEK_END);
+	*res = ftello(root_image);
+	return 0;
+}
+
+static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
+{
+	int status = LKL_DEV_BLK_STATUS_OK;
+
+	if (req->type == LKL_DEV_BLK_TYPE_FLUSH || req->type == LKL_DEV_BLK_TYPE_FLUSH_OUT)
+		return LKL_DEV_BLK_STATUS_OK;
+	if (req->type != LKL_DEV_BLK_TYPE_READ)
+		return LKL_DEV_BLK_STATUS_UNSUP;
+	mutexLock(&root_lock);
+	if (fseeko(root_image, req->sector * 512, SEEK_SET))
+		status = LKL_DEV_BLK_STATUS_IOERR;
+	for (int i = 0; i < req->count && status == LKL_DEV_BLK_STATUS_OK; i++)
+		if (fread(req->buf[i].iov_base, 1, req->buf[i].iov_len, root_image) !=
+		    req->buf[i].iov_len)
+			status = LKL_DEV_BLK_STATUS_IOERR;
+	mutexUnlock(&root_lock);
+	return status;
+}
+
+/* Under the name LKL's disk code looks for its default operations. */
+struct lkl_dev_blk_ops lkl_dev_blk_ops = {
+	.get_capacity = image_capacity,
+	.request = image_request,
+};
+
+/* What a program expects around its files, whatever the root is made of. The
+ * mount points have to exist already when the root is a read-only image. */
+static void populate_root(void)
+{
+	static const char *const dirs[] = { "/proc", "/sys", "/dev", "/tmp", "/run", "/root" };
+	static const struct {
+		const char *path;
+		int minor;
+	} nodes[] = {
+		{ "/dev/null", 3 }, { "/dev/zero", 5 }, { "/dev/full", 7 },
+		{ "/dev/random", 8 }, { "/dev/urandom", 9 },
+	};
+
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+		lkl_sys_mkdir(dirs[i], 0755);
+	lkl_sys_mount("proc", "/proc", "proc", 0, NULL);
+	lkl_sys_mount("sysfs", "/sys", "sysfs", 0, NULL);
+	/* "tmpfs" is ramfs in a kernel without an MMU. */
+	lkl_sys_mount("tmpfs", "/dev", "tmpfs", 0, NULL);
+	lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
+	lkl_sys_mount("tmpfs", "/run", "tmpfs", 0, NULL);
+	lkl_sys_mount("tmpfs", "/root", "tmpfs", 0, NULL);
+	lkl_sys_mkdir("/dev/shm", 01777);
+	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
+		lkl_sys_mknod(nodes[i].path, LKL_S_IFCHR | 0666, 1 << 8 | nodes[i].minor);
+}
+
+/* ---------- files out of the guest ---------- */
+
+/*
+ * The screen once the console has given it up: one picture at a time, drawn
+ * as a texture over the whole of it. With GLES like the guest's own graphics:
+ * a plain libnx framebuffer made after the console is gone fails on its first
+ * frame (seen on hardware). All of it happens on the thread that calls
+ * screen_show() first.
+ */
+static EGLDisplay screen_display;
+static EGLSurface screen_surface;
+static int screen_ready;
+
+static int screen_open(void)
+{
+	static const char vertex_source[] =
+		"attribute vec2 p; varying vec2 t;\n"
+		"void main() { t = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = vec4(p, 0.0, 1.0); }\n";
+	static const char fragment_source[] =
+		"precision mediump float; uniform sampler2D s; varying vec2 t;\n"
+		"void main() { gl_FragColor = texture2D(s, t); }\n";
+	static const GLfloat corners[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	static const EGLint config_attribs[] = {
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE,
+	};
+	static const EGLint context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+	const char *sources[2] = { vertex_source, fragment_source };
+	EGLContext context;
+	EGLConfig config;
+	EGLint count = 0;
+	GLuint program, texture;
+
+	console_off();
+
+	screen_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	if (!eglInitialize(screen_display, NULL, NULL) || !eglBindAPI(EGL_OPENGL_ES_API) ||
+	    !eglChooseConfig(screen_display, config_attribs, &config, 1, &count) || count < 1) {
+		host_log("gx: no EGL for the screen (%#x)\n", eglGetError());
+		return -1;
+	}
+	screen_surface = eglCreateWindowSurface(screen_display, config, nwindowGetDefault(), NULL);
+	context = eglCreateContext(screen_display, config, EGL_NO_CONTEXT, context_attribs);
+	if (screen_surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+	    !eglMakeCurrent(screen_display, screen_surface, screen_surface, context)) {
+		host_log("gx: no EGL surface for the screen (%#x)\n", eglGetError());
+		return -1;
+	}
+
+	program = glCreateProgram();
+	for (int i = 0; i < 2; i++) {
+		GLuint shader = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+
+		glShaderSource(shader, 1, &sources[i], NULL);
+		glCompileShader(shader);
+		glAttachShader(program, shader);
+	}
+	glBindAttribLocation(program, 0, "p");
+	glLinkProgram(program);
+	glUseProgram(program);
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, corners);
+	glEnableVertexAttribArray(0);
+	glViewport(0, 0, 1280, 720);
+	return 0;
+}
+
+/* Shows RGBA pixels; twice when the picture is to stay (there are two
+ * buffers, and the screen shows either). */
+static void screen_show(const u8 *pixels, int width, int height, int passes)
+{
+	if (!screen_ready && screen_open())
+		return;
+	screen_ready = 1;
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	for (int pass = 0; pass < passes; pass++) {
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		eglSwapBuffers(screen_display, screen_surface);
+	}
+}
+
+/* Puts a PNG on the screen in place of the console: the page a headless
+ * Chromium drew when it was asked for a picture. The text that follows only
+ * goes to the log. */
+static void show_picture(const char *path)
+{
+	png_image image = { .version = PNG_IMAGE_VERSION };
+	u8 *pixels;
+
+	if (!png_image_begin_read_from_file(&image, path))
+		return;
+	image.format = PNG_FORMAT_RGBA;
+	pixels = malloc(PNG_IMAGE_SIZE(image));
+	if (!pixels || !png_image_finish_read(&image, NULL, pixels, 0, NULL)) {
+		png_image_free(&image);
+		free(pixels);
+		return;
+	}
+	host_log("gx: showing %s (%ux%u); the rest is in the log\n", path, image.width, image.height);
+	sync_log();
+	screen_show(pixels, image.width, image.height, 2);
+	host_log("gx: shown (GL error %#x)\n", glGetError());
+	free(pixels);
+}
+
+/* ---------- a screen and a user for Chromium (cdp.c) ---------- */
+
+/* Writes a number in the top left corner of a picture: the pictures per
+ * second, while smoothness is what is being worked on. */
+static void draw_number(u8 *pixels, int width, int height, int number)
+{
+	/* Digits of 3 by 5 dots, a row per three bits, top row first. */
+	static const u16 digits[10] = {
+		075557, 026227, 071747, 071717, 055711, 074717, 074757, 071111, 075757, 075717,
+	};
+	enum { DOT = 6, GAP = 3 };
+	char text[8];
+	int count = snprintf(text, sizeof(text), "%d", number < 0 ? 0 : number > 999 ? 999 : number);
+	int box_w = count * (3 * DOT + GAP) + GAP, box_h = 5 * DOT + 2 * GAP;
+
+	if (box_w > width || box_h > height)
+		return;
+	for (int y = 0; y < box_h; y++)
+		memset(pixels + (size_t)y * width * 4, 0, box_w * 4);
+	for (int i = 0; i < count; i++) {
+		u16 shape = digits[text[i] - '0'];
+
+		for (int dot = 0; dot < 15; dot++) {
+			int x0 = GAP + i * (3 * DOT + GAP) + dot % 3 * DOT, y0 = GAP + dot / 3 * DOT;
+
+			if (!(shape >> (14 - dot) & 1))
+				continue;
+			for (int y = y0; y < y0 + DOT; y++)
+				for (int x = x0; x < x0 + DOT; x++)
+					memcpy(pixels + ((size_t)y * width + x) * 4, "\x30\xff\x30\xff", 4);
+		}
+	}
+}
+
+void host_frame(const uint8_t *jpeg, size_t len)
+{
+	static tjhandle decoder;
+	static u8 *pixels;
+	static int room, frames;
+	int width = 0, height = 0, subsampling = 0, colorspace = 0;
+
+	if (!decoder)
+		decoder = tjInitDecompress();
+	if (!decoder || tjDecompressHeader3(decoder, jpeg, len, &width, &height, &subsampling,
+					    &colorspace) || width <= 0 || height <= 0)
+		return;
+	if (width * height * 4 > room) {
+		free(pixels);
+		room = width * height * 4;
+		pixels = malloc(room);
+	}
+	if (!pixels || tjDecompress2(decoder, jpeg, len, pixels, width, 0, height, TJPF_RGBA,
+				     TJFLAG_FASTDCT))
+		return;
+	if (!frames++)
+		host_log("gx: first picture of the page (%dx%d); the rest is in the log\n", width, height);
+	draw_number(pixels, width, height, cdp_frames_per_second);
+	screen_show(pixels, width, height, 1);
+}
+
+/*
+ * The user: a finger on the screen is a finger on the page; the sticks and
+ * the d-pad scroll; B goes back, X reloads, Y asks for an address, A for text
+ * to type where the focus is, and R is the Enter key. (+ quits, in main().)
+ */
+static int ask_text(const char *guide, const char *initial, char *out, size_t room)
+{
+	SwkbdConfig keyboard;
+	Result rc = swkbdCreate(&keyboard, 0);
+
+	out[0] = 0;
+	if (R_FAILED(rc))
+		return 0;
+	swkbdConfigMakePresetDefault(&keyboard);
+	swkbdConfigSetGuideText(&keyboard, guide);
+	swkbdConfigSetInitialText(&keyboard, initial);
+	rc = swkbdShow(&keyboard, out, room);
+	swkbdClose(&keyboard);
+	return R_SUCCEEDED(rc) && out[0];
+}
+
+int host_input(struct cdp_input *in)
+{
+	static PadState pad;
+	static int ready, touching, last_x, last_y;
+	static u64 last_scroll;
+	HidTouchScreenState touch = { 0 };
+	HidAnalogStickState left, right;
+	u64 down, now = armGetSystemTick();
+	int dy;
+
+	if (!ready) {
+		padInitializeDefault(&pad);
+		hidInitializeTouchScreen();
+		ready = 1;
+	}
+	memset(in, 0, sizeof(*in));
+
+	if (hidGetTouchScreenStates(&touch, 1) && touch.count) {
+		int x = touch.touches[0].x, y = touch.touches[0].y;
+
+		if (!touching || abs(x - last_x) + abs(y - last_y) >= 2) {
+			in->type = touching ? CDP_TOUCH_MOVE : CDP_TOUCH_DOWN;
+			in->x = last_x = x;
+			in->y = last_y = y;
+			touching = 1;
+			return 1;
+		}
+		return 0;
+	}
+	if (touching) {
+		touching = 0;
+		in->type = CDP_TOUCH_UP;
+		in->x = last_x;
+		in->y = last_y;
+		return 1;
+	}
+
+	padUpdate(&pad);
+	down = padGetButtonsDown(&pad);
+	if (down & HidNpadButton_B) {
+		in->type = CDP_BACK;
+	} else if (down & HidNpadButton_X) {
+		in->type = CDP_RELOAD;
+	} else if (down & HidNpadButton_R) {
+		in->type = CDP_ENTER;
+	} else if (down & HidNpadButton_Y) {
+		if (ask_text("Address", "https://", in->text, sizeof(in->text)))
+			in->type = CDP_NAVIGATE;
+	} else if (down & HidNpadButton_A) {
+		if (ask_text("Text to type", "", in->text, sizeof(in->text)))
+			in->type = CDP_TEXT;
+	} else if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
+		in->type = CDP_SCROLL;
+		in->y = (down & HidNpadButton_Down) ? 240 : -240;
+	} else if (armTicksToNs(now - last_scroll) > 16000000ULL) {
+		/* The sticks, sixty times a second while they are pushed: at
+		 * most one step per picture the screen can show. */
+		left = padGetStickPos(&pad, 0);
+		right = padGetStickPos(&pad, 1);
+		dy = abs(left.y) > abs(right.y) ? left.y : right.y;
+		if (abs(dy) > 6000) {
+			last_scroll = now;
+			in->type = CDP_SCROLL;
+			in->y = -dy / 1200;
+		}
+	}
+	return in->type != CDP_NONE;
+}
+
+static const char *export_path;   /* a guest file to copy to sdmc:/gx when the guest exits */
+
+static void export_file(void)
+{
+	static char buf[1 << 16];
+	const char *name = export_path ? strrchr(export_path, '/') : NULL;
+	char host[512];
+	FILE *out;
+	long n;
+	int in;
+
+	if (!name)
+		return;
+	in = lkl_sys_open(export_path, LKL_O_RDONLY, 0);
+	if (in < 0) {
+		host_log("gx: the guest left no %s\n", export_path);
+		return;
+	}
+	snprintf(host, sizeof(host), GX_DIR "%s", name);
+	out = fopen(host, "wb");
+	while (out && (n = lkl_sys_read(in, buf, sizeof(buf))) > 0)
+		fwrite(buf, 1, n, out);
+	if (out)
+		fclose(out);
+	host_log("gx: %s copied to %s\n", export_path, host);
+	if (strlen(host) > 4 && !strcmp(host + strlen(host) - 4, ".png"))
+		show_picture(host);
+}
+
+/* ---------- aborts ---------- */
+
+extern char _start[];
+
+/* These replace libnx's and newlib's, which end the process on the spot: an
+ * abort of host code (libnx, Mesa, newlib) would otherwise leave no trace. */
+static void report_kernel_use(void);
+
+/* Only the thread that aborted stops: the others may still say something. */
+static void stop_here(void)
+{
+	report_kernel_use();
+	host_log("This thread stops here. Press + to quit.\n");
+	sync_log();
+	for (;;)
+		svcSleepThread(1000000000ULL);
+}
+
+void diagAbortWithResult(Result res)
+{
+	/* Not on the screen if it is the console that fails: this very thread
+	 * is the one that would have shown it. */
+	if (res == MAKERESULT(Module_Libnx, LibnxError_BadGfxDequeueBuffer))
+		console_on = 0;
+	host_log("\ngx: the host aborted with result %#x (module %u, description %u), called from %p"
+		 " (gx is at %p)\n",
+		 res, R_MODULE(res), R_DESCRIPTION(res), __builtin_return_address(0), _start);
+	stop_here();
+	__builtin_unreachable();
+}
+
+void abort(void)
+{
+	host_log("\ngx: the host called abort(), from %p\n", __builtin_return_address(0));
+	stop_here();
+	__builtin_unreachable();
+}
+
+/* ---------- sysroot import ---------- */
+
+static int import_tree(const char *host, const char *guest)
+{
+	static char buf[1 << 16];
+	DIR *d = opendir(host);
+	struct dirent *e;
+
+	if (!d) {
+		host_log("gx: cannot read %s\n", host);
+		return -1;
+	}
+	while ((e = readdir(d))) {
+		char hp[768], gp[768];
+		struct stat st;
+
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		snprintf(hp, sizeof(hp), "%s/%s", host, e->d_name);
+		snprintf(gp, sizeof(gp), "%s/%s", guest, e->d_name);
+		if (stat(hp, &st))
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			lkl_sys_mkdir(gp, 0755);
+			import_tree(hp, gp);
+		} else if (S_ISREG(st.st_mode)) {
+			FILE *in = fopen(hp, "rb");
+			int out = lkl_sys_open(gp, LKL_O_WRONLY | LKL_O_CREAT | LKL_O_TRUNC, 0755);
+			size_t n;
+
+			if (!in || out < 0) {
+				host_log("gx: cannot import %s (%d)\n", hp, out);
+				if (in)
+					fclose(in);
+				continue;
+			}
+			while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+				lkl_sys_write(out, buf, n);
+			fclose(in);
+			lkl_sys_close(out);
+		}
+	}
+	closedir(d);
+	return 0;
+}
+
+/* ---------- the menu and the run ---------- */
+
+#define MAX_COMMANDS 16
+#define MAX_ARGS 32
+
+static char commands[MAX_COMMANDS][1024];
+static const char *root_image_name;   /* @<image>: an ext4 image of sdmc:/gx as the root */
+static int browser;                   /* -b: the program is a Chromium to drive (cdp.c) */
+static int cpu_count;                 /* -c<n>: processors the guest is told about */
+static int command_count;
+static char *guest_argv[MAX_ARGS + 1];
+static int guest_argc;
+
+static void read_commands(void)
+{
+	FILE *f = fopen(GX_DIR "/programs.txt", "r");
+	char line[1024];
+
+	while (f && command_count < MAX_COMMANDS && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		if (line[0] && line[0] != '#')
+			strcpy(commands[command_count++], line);
+	}
+	if (f)
+		fclose(f);
+	if (!command_count)
+		strcpy(commands[command_count++], "/bin/hello");
+}
+
+/* Returns the command chosen with the d-pad and A, or -1 if + was pressed. */
+static int menu(PadState *pad)
+{
+	int choice = 0, drawn = -1;
+
+	while (appletMainLoop()) {
+		u64 down;
+
+		if (drawn != choice) {
+			consoleClear();
+			printf("gx - Linux programs on Horizon\n\n");
+			for (int i = 0; i < command_count; i++) {
+				/* "[label] command" shows as its label. */
+				char *end = commands[i][0] == '[' ? strchr(commands[i], ']') : NULL;
+
+				if (end)
+					printf(" %c %.*s\n", i == choice ? '>' : ' ',
+					       (int)(end - commands[i] - 1), commands[i] + 1);
+				else
+					printf(" %c %.74s\n", i == choice ? '>' : ' ', commands[i]);
+			}
+			printf("\nUp/Down: choose   A: run   +: quit\n");
+			drawn = choice;
+		}
+		consoleUpdate(NULL);
+		padUpdate(pad);
+		down = padGetButtonsDown(pad);
+		if (down & HidNpadButton_Plus)
+			return -1;
+		if (down & HidNpadButton_A)
+			return choice;
+		if (down & HidNpadButton_AnyDown)
+			choice = (choice + 1) % command_count;
+		if (down & HidNpadButton_AnyUp)
+			choice = (choice + command_count - 1) % command_count;
+		svcSleepThread(16666666ULL);
+	}
+	return -1;
+}
+
+static void run(void *arg)
+{
+	static char *guest_env[] = {
+		"PATH=/bin:/usr/bin", "HOME=/root", "LD_LIBRARY_PATH=/lib", "TMPDIR=/tmp", NULL,
+	};
+	struct __lkl__kernel_timespec now = { .tv_sec = time(NULL) };
+	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
+	int ret, net_id = -1, disk_id = -1;
+
+	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
+	/* Where LKL's virtio devices tell the kernel they exist. */
+	lkl_host_ops.virtio_devices = lkl_virtio_devs;
+	ret = lkl_init(&lkl_host_ops);
+	if (!ret)
+		net_id = net_add();
+	if (!ret && root_image_name) {
+		char path[512];
+
+		snprintf(path, sizeof(path), GX_DIR "/%s", root_image_name);
+		root_image = fopen(path, "rb");
+		if (root_image) {
+			/* The SD card is slow by small pieces. */
+			setvbuf(root_image, NULL, _IOFBF, 1 << 20);
+			disk_id = lkl_disk_add(&root_disk);
+		}
+		if (disk_id < 0) {
+			host_log("gx: cannot use %s as a disk (%d)\n", path, disk_id);
+			host_exit(1);
+		}
+	}
+	if (!ret)
+		ret = lkl_start_kernel(KERNEL_ARGS);
+	if (ret) {
+		host_log("gx: the kernel did not start (%d)\n", ret);
+		host_exit(1);
+	}
+	/* The kernel has no clock to read the date from and starts in 1970. */
+	lkl_syscall(__lkl__NR_clock_settime, params);
+	if (net_id >= 0)
+		net_up(net_id);
+
+	if (disk_id >= 0) {
+		static const char node[] = "/gx-root-disk", mnt[] = "/gx-root";
+		long mknod_args[6] = { LKL_AT_FDCWD, (long)node, LKL_S_IFBLK | 0600 };
+		uint32_t dev = 0;
+
+		/* By hand rather than with lkl_mount_dev(): LKL's wrappers pass
+		 * the device number as a dev_t, which is 16 bits here and loses
+		 * the major number of virtio disks. */
+		ret = lkl_get_virtio_blkdev(disk_id, 0, &dev);
+		mknod_args[3] = dev;
+		if (!ret)
+			ret = lkl_syscall(__lkl__NR_mknodat, mknod_args);
+		if (!ret)
+			ret = lkl_sys_mkdir(mnt, 0755);
+		if (!ret)
+			ret = lkl_sys_mount((char *)node, (char *)mnt, "ext4", LKL_MS_RDONLY, NULL);
+		if (!ret)
+			ret = lkl_sys_chroot(mnt);
+		if (!ret)
+			ret = lkl_sys_chdir("/");
+		if (ret) {
+			host_log("gx: cannot mount %s (%d)\n", root_image_name, ret);
+			host_exit(1);
+		}
+		host_log("gx: root is %s\n", root_image_name);
+	} else {
+		host_log("gx: copying %s\n", GX_DIR "/sysroot");
+		if (import_tree(GX_DIR "/sysroot", ""))
+			host_exit(1);
+	}
+	populate_root();
+	if (cpu_count)
+		gx_set_cpus(cpu_count);
+	/* Descriptors 0-2 are the console; keep the kernel from handing those
+	 * numbers out. */
+	for (int i = 0; i < 3; i++)
+		lkl_sys_open("/tmp/.stdio", LKL_O_RDWR | LKL_O_CREAT, 0644);
+
+	if (gmem_init()) {
+		host_log("gx: cannot set up the guest address space\n");
+		host_exit(1);
+	}
+	if (browser && cdp_start())
+		host_log("gx: cannot set up the pipe to Chromium\n");
+	host_log("gx: running %s\n\n", guest_argv[0]);
+	gx_exec(guest_argv[0], guest_argc, guest_argv, guest_env);
+	host_exit(1);
+}
+
+/* What the process costs the kernel: it keeps a record per run of pages that
+ * are mapped alike, out of a store that every program on the console shares,
+ * and things start failing (IPC first) when the store runs dry. */
+static void report_kernel_use(void)
+{
+	u64 addr = 0, end = 0, size = 0, blocks = 0, code = 0, shared = 0, heap = 0;
+	int handles = 0;
+
+	svcGetInfo(&addr, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
+	svcGetInfo(&size, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0);
+	end = addr + size;
+	while (addr < end) {
+		MemoryInfo info;
+		u32 page_info;
+
+		if (R_FAILED(svcQueryMemory(&info, &page_info, addr)) || !info.size)
+			break;
+		addr = info.addr + info.size;
+		if (info.type == MemType_Unmapped || info.type == MemType_Reserved)
+			continue;
+		blocks++;
+		if (info.type == MemType_ModuleCodeStatic || info.type == MemType_ModuleCodeMutable)
+			code++;
+		else if (info.type == MemType_SharedMem)
+			shared++;
+		else if (info.type == MemType_Heap)
+			heap++;
+	}
+	for (int i = 0; i < MAX_SHARED_HANDLES; i++)
+		handles += shared_handles[i] != 0;
+	host_log("gx: kernel memory blocks: %lu (%lu guest, %lu shared, %lu heap); "
+		 "%d shared objects; %lu MB of the pool free\n",
+		 (unsigned long)blocks, (unsigned long)code, (unsigned long)shared,
+		 (unsigned long)heap, handles, (unsigned long)(pool_free >> 8));
+}
+
+/* Every so often, says in the log where the guest's threads are and what the
+ * process costs: a guest that hangs leaves nothing else to go by. */
+static void watchdog(void *arg)
+{
+	for (int seconds = 10;; seconds += 10) {
+		svcSleepThread(10000000000ULL);
+		if (finished)
+			break;
+		host_log("gx: after %d s\n", seconds);
+		report_kernel_use();
+		gx_report_threads();
+		sync_log();
+	}
+}
+
+/* The only thread that draws: consoleUpdate() is not thread-safe, and the
+ * console may stop for good in there (see console_off()). */
+static void display(void *arg)
+{
+	for (;;) {
+		mutexLock(&screen_lock);
+		if (console_on)
+			consoleUpdate(NULL);
+		mutexUnlock(&screen_lock);
+		svcSleepThread(16666666ULL);
+	}
+}
+
+int main(int argc, char **argv)
+{
+	static Thread display_thread, watchdog_thread;
+	PadState pad;
+	int choice;
+
+	consoleInit(NULL);
+	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+	padInitializeDefault(&pad);
+	mkdir(GX_DIR, 0777);
+	read_commands();
+	choice = menu(&pad);
+	if (choice < 0) {
+		consoleExit(NULL);
+		svcExitProcess();   /* see __libnx_initheap() */
+	}
+	consoleClear();
+	log_file = fopen(GX_DIR "/gx.log", "w");
+
+	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
+		memmove(commands[choice], strchr(commands[choice], ']') + 1,
+			strlen(strchr(commands[choice], ']')));
+	for (char *word = strtok(commands[choice], " "); word && guest_argc < MAX_ARGS;
+	     word = strtok(NULL, " ")) {
+		/* Before the program: -t, -b, @<root image>, ><guest file to copy out>. */
+		if (!guest_argc && !strcmp(word, "-t"))
+			gx_trace = 1;
+		else if (!guest_argc && !strcmp(word, "-b"))
+			browser = 1;
+		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2])
+			cpu_count = atoi(word + 2);
+		else if (!guest_argc && word[0] == '@')
+			root_image_name = word + 1;
+		else if (!guest_argc && word[0] == '>')
+			export_path = word + 1;
+		else
+			guest_argv[guest_argc++] = word;
+	}
+	if (!guest_argc)
+		guest_argv[guest_argc++] = "/bin/hello";
+
+	/* Everything runs on created threads: on the main thread of a homebrew,
+	 * threadGetSelf() is not what LKL needs it to be (see nro/source/main.c). */
+	if (R_SUCCEEDED(threadCreate(&display_thread, display, NULL, NULL, 0x8000, 0x2C, -2)))
+		threadStart(&display_thread);
+	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, 0x2C, -2)))
+		threadStart(&watchdog_thread);
+	if (start_thread(run, NULL, MAIN_STACK))
+		printf("gx: cannot start\n");
+
+	while (appletMainLoop()) {
+		padUpdate(&pad);
+		if (padGetButtonsDown(&pad) & HidNpadButton_Plus)
+			break;
+		svcSleepThread(16666666ULL);
+	}
+	/* Kernel and guest threads cannot be stopped one by one; ending the
+	 * process is the only clean way out (back to the HOME menu). */
+	mutexLock(&print_lock);
+	if (log_file)
+		fclose(log_file);
+	svcExitProcess();
+	return 0;
+}

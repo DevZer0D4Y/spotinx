@@ -1,0 +1,663 @@
+/*
+ * gsys.c - what a guest syscall becomes.
+ *
+ * Memory, threads, futexes and process exit are handled here, because LKL has
+ * no MMU, no user processes and is built without futexes. Everything else
+ * (files, pipes, sockets, time) goes to the kernel through lkl_syscall().
+ */
+#include <string.h>
+#include <lkl.h>
+#include "gx.h"
+
+#define CLONE_VM 0x100
+#define CLONE_THREAD 0x10000
+#define CLONE_SETTLS 0x80000
+#define CLONE_PARENT_SETTID 0x100000
+#define CLONE_CHILD_CLEARTID 0x200000
+#define CLONE_CHILD_SETTID 0x1000000
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_REQUEUE 3
+#define FUTEX_CMP_REQUEUE 4
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_CLOCK_REALTIME 256
+
+struct gx_tp_slot gx_tp_tab[GX_MAX_THREADS] = {
+	[0 ... GX_MAX_THREADS - 1] = { ~0UL, NULL },
+};
+struct gx_thread *gx_main_thread;
+int gx_trace;
+
+static int cpus = 1;
+
+/* Programs size their thread pools on this. The kernel has one processor of
+ * its own, so what it shows in /sys is covered with what we want read there;
+ * the threads are the host's to schedule either way. */
+void gx_set_cpus(int count)
+{
+	static const char dir[] = "/sys/devices/system/cpu";
+	static const char *const files[] = { "online", "possible", "present" };
+	char path[64], range[16];
+	int len = 0;
+
+	if (count < 1 || count > 64 || lkl_sys_mount("tmpfs", (char *)dir, "tmpfs", 0, NULL))
+		return;
+	cpus = count;
+	range[len++] = '0';
+	if (count > 1) {
+		range[len++] = '-';
+		if (count > 10)
+			range[len++] = '0' + (count - 1) / 10;
+		range[len++] = '0' + (count - 1) % 10;
+	}
+	range[len++] = '\n';
+	for (int i = 0; i < 3; i++) {
+		int fd;
+
+		strcpy(path, dir);
+		strcat(path, "/");
+		strcat(path, files[i]);
+		fd = lkl_sys_open(path, LKL_O_WRONLY | LKL_O_CREAT, 0444);
+		if (fd >= 0) {
+			lkl_sys_write(fd, range, len);
+			lkl_sys_close(fd);
+		}
+	}
+	for (int i = 0; i < count; i++) {
+		int at;
+
+		strcpy(path, dir);
+		strcat(path, "/cpu");
+		at = strlen(path);
+		if (i >= 10)
+			path[at++] = '0' + i / 10;
+		path[at++] = '0' + i % 10;
+		path[at] = 0;
+		lkl_sys_mkdir(path, 0555);
+	}
+}
+
+static struct gx_thread threads[GX_MAX_THREADS];
+static int thread_used[GX_MAX_THREADS];
+static int next_tid = 101;
+static int live_threads = 1;
+static struct host_lock *big_lock;
+
+static void lock(void)
+{
+	if (!big_lock) {
+		/* Still single-threaded the first time: clone() takes it first. */
+		big_lock = host_lock_new();
+	}
+	host_lock_acquire(big_lock);
+}
+
+static void unlock(void) { host_lock_release(big_lock); }
+
+/* ---------- futexes ---------- */
+
+struct waiter {
+	uint32_t *addr;
+	uint32_t bitset;
+	int woken;
+	struct host_cond *cond;
+	struct waiter *next;
+};
+static struct waiter *waiters;
+
+/*
+ * clock_gettime() without the kernel. Linux programs read the clock all the
+ * time (Chromium, tens of thousands of times a second) because it costs them
+ * nothing there: the kernel answers in the program's own memory, without a
+ * syscall. Here every syscall is a real one and they all take turns on the
+ * one processor the kernel has. The kernel's clocks are the host's clock plus
+ * a constant, measured once per clock.
+ */
+#define CLOCKS 12
+
+static int64_t clock_offset[CLOCKS];
+static int clock_known[CLOCKS];
+
+static long fast_clock_gettime(long id, struct lkl_timespec *ts)
+{
+	uint64_t ns;
+
+	if (id == 3 /* CLOCK_THREAD_CPUTIME_ID */) {
+		ns = host_thread_cpu_ns(host_thread_self());
+	} else if (id == 0 || id == 1 || (id >= 4 && id <= 7) /* real, monotonic, coarse, boot */) {
+		if (!__atomic_load_n(&clock_known[id], __ATOMIC_ACQUIRE)) {
+			struct lkl_timespec kernel;
+			long params[6] = { id, (long)&kernel };
+			uint64_t before = host_now_ns();
+			long ret = lkl_syscall(__lkl__NR_clock_gettime, params);
+
+			if (ret)
+				return ret;
+			/* Against the middle of the time the question took. */
+			clock_offset[id] = (int64_t)kernel.tv_sec * 1000000000LL + kernel.tv_nsec -
+					   (int64_t)(before + (host_now_ns() - before) / 2);
+			__atomic_store_n(&clock_known[id], 1, __ATOMIC_RELEASE);
+		}
+		ns = host_now_ns() + clock_offset[id];
+	} else {
+		return 1;   /* the kernel's to answer */
+	}
+	ts->tv_sec = ns / 1000000000ULL;
+	ts->tv_nsec = ns % 1000000000ULL;
+	return 0;
+}
+
+static int64_t timeout_ns(const struct lkl_timespec *ts, int absolute, int clock)
+{
+	int64_t ns;
+
+	if (!ts)
+		return -1;
+	ns = (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+	if (absolute) {
+		/* The deadline is on the clock the guest reads. */
+		struct lkl_timespec now;
+
+		if (fast_clock_gettime(clock, &now) == 0)
+			ns -= (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+	}
+	return ns < 0 ? 0 : ns;
+}
+
+static long futex_wait(struct gx_thread *self, uint32_t *addr, uint32_t val, int64_t ns,
+		       uint32_t bitset)
+{
+	struct waiter w = { addr, bitset, 0, NULL, NULL }, **p;
+	long ret = 0;
+
+	lock();
+	if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) != val) {
+		unlock();
+		return -GX_EAGAIN;
+	}
+	if (!self->cond)
+		self->cond = host_cond_new();
+	w.cond = self->cond;
+	w.next = waiters;
+	waiters = &w;
+	while (!w.woken) {
+		if (host_cond_wait(w.cond, big_lock, ns)) {
+			ret = w.woken ? 0 : -GX_ETIMEDOUT;
+			break;
+		}
+	}
+	for (p = &waiters; *p; p = &(*p)->next) {
+		if (*p == &w) {
+			*p = w.next;
+			break;
+		}
+	}
+	unlock();
+	return ret;
+}
+
+/* Wakes up to n waiters on addr and moves up to n2 of the others to addr2. */
+static long futex_wake(uint32_t *addr, int n, uint32_t bitset, uint32_t *addr2, int n2)
+{
+	long count = 0;
+
+	lock();
+	for (struct waiter *w = waiters; w; w = w->next) {
+		if (w->addr != addr || w->woken || !(w->bitset & bitset))
+			continue;
+		if (count < n) {
+			w->woken = 1;
+			host_cond_signal(w->cond);
+			count++;
+		} else if (addr2 && n2 > 0) {
+			w->addr = addr2;
+			n2--;
+			count++;
+		}
+	}
+	unlock();
+	return count;
+}
+
+static long do_futex(struct gx_frame *f, struct gx_thread *self)
+{
+	uint32_t *addr = (uint32_t *)f->x[0];
+	int op = (int)f->x[1], cmd = op & 0x7f;
+	uint32_t val = (uint32_t)f->x[2];
+	int clock = (op & FUTEX_CLOCK_REALTIME) ? 0 : 1;
+
+	switch (cmd) {
+	case FUTEX_WAIT:
+		return futex_wait(self, addr, val, timeout_ns((void *)f->x[3], 0, clock), ~0u);
+	case FUTEX_WAIT_BITSET:
+		return futex_wait(self, addr, val, timeout_ns((void *)f->x[3], 1, clock),
+				  (uint32_t)f->x[5]);
+	case FUTEX_WAKE:
+		return futex_wake(addr, (int)val, ~0u, NULL, 0);
+	case FUTEX_WAKE_BITSET:
+		return futex_wake(addr, (int)val, (uint32_t)f->x[5], NULL, 0);
+	case FUTEX_CMP_REQUEUE:
+		if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) != (uint32_t)f->x[5])
+			return -GX_EAGAIN;
+		/* fall through */
+	case FUTEX_REQUEUE:
+		return futex_wake(addr, (int)val, ~0u, (uint32_t *)f->x[4], (int)f->x[3]);
+	}
+	return -GX_ENOSYS;
+}
+
+/* ---------- threads ---------- */
+
+static void thread_main(void *arg)
+{
+	struct gx_thread *t = arg;
+
+	gx_enter_frame(t->start, t);
+}
+
+static long do_clone(struct gx_frame *f)
+{
+	uint64_t flags = f->x[0], stack = f->x[1], tls = f->x[3];
+	int *ptid = (int *)f->x[2], *ctid = (int *)f->x[4];
+	struct gx_thread *t = NULL;
+	struct gx_frame *child;
+	int slot = -1;
+
+	if (!(flags & CLONE_VM) || !(flags & CLONE_THREAD) || !stack) {
+		host_log("gx: clone(%#lx) asks for a process, which is not supported\n",
+			 (unsigned long)flags);
+		return -GX_ENOSYS;
+	}
+	lock();
+	for (int i = 0; i < GX_MAX_THREADS; i++) {
+		if (!thread_used[i]) {
+			thread_used[i] = 1;
+			t = &threads[i];
+			slot = i;
+			break;
+		}
+	}
+	if (!t) {
+		unlock();
+		return -GX_EAGAIN;
+	}
+	t->clear_tid = NULL;
+	t->nr = -1;
+	t->host_id = 0;
+	t->name[0] = 0;
+	t->syscalls = t->reported_syscalls = t->reported_cpu_ns = 0;
+	t->tid = next_tid++;
+	live_threads++;
+	unlock();
+
+	/* The child resumes after the same svc as its parent: its frame is a copy
+	 * of the parent's, placed under the two words the exit veneer pops. */
+	stack &= ~15UL;
+	memcpy((void *)(stack - 16), (uint8_t *)f + GX_FRAME_SIZE, 16);
+	child = (struct gx_frame *)(stack - 16 - GX_FRAME_SIZE);
+	memcpy(child, f, GX_FRAME_SIZE);
+	child->result = 0;
+	if (flags & CLONE_SETTLS)
+		child->gtp = tls;
+	t->start = child;
+	if (flags & CLONE_PARENT_SETTID)
+		*ptid = t->tid;
+	if (flags & CLONE_CHILD_SETTID)
+		*ctid = t->tid;
+	if (flags & CLONE_CHILD_CLEARTID)
+		t->clear_tid = ctid;
+	gx_tp_tab[slot].thread = t;
+	__atomic_store_n(&gx_tp_tab[slot].guest_tp, child->gtp, __ATOMIC_SEQ_CST);
+
+	if (host_thread_start(thread_main, t)) {
+		lock();
+		gx_tp_tab[slot].guest_tp = ~0UL;
+		thread_used[slot] = 0;
+		live_threads--;
+		unlock();
+		return -GX_EAGAIN;
+	}
+	return t->tid;
+}
+
+static void do_exit_thread(struct gx_thread *t, int code)
+{
+	int last;
+
+	if (t->clear_tid) {
+		*t->clear_tid = 0;
+		futex_wake((uint32_t *)t->clear_tid, 1, ~0u, NULL, 0);
+	}
+	lock();
+	last = --live_threads == 0;
+	if (t != gx_main_thread) {
+		int slot = t - threads;
+
+		gx_tp_tab[slot].guest_tp = ~0UL;
+		thread_used[slot] = 0;
+	}
+	unlock();
+	if (last)
+		host_exit(code);
+	host_thread_exit();
+}
+
+/* ---------- everything else ---------- */
+
+static long translate_open_flags(long af)
+{
+	long lf = af & 03;
+
+	if (af & 0100) lf |= 0100;        /* O_CREAT */
+	if (af & 0200) lf |= 0200;        /* O_EXCL */
+	if (af & 0400) lf |= 0400;        /* O_NOCTTY */
+	if (af & 01000) lf |= 01000;      /* O_TRUNC */
+	if (af & 02000) lf |= 02000;      /* O_APPEND */
+	if (af & 04000) lf |= 04000;      /* O_NONBLOCK */
+	if (af & 040000) lf |= 0200000;   /* O_DIRECTORY */
+	if (af & 0100000) lf |= 0400000;  /* O_NOFOLLOW */
+	if (af & 0200000) lf |= 040000;   /* O_DIRECT */
+	if (af & 0400000) lf |= 0100000;  /* O_LARGEFILE */
+	if (af & 02000000) lf |= 02000000; /* O_CLOEXEC */
+	if (af & 010000000) lf |= 010000000; /* O_PATH */
+	return lf;
+}
+
+struct gx_iovec { void *base; uint64_t len; };
+
+static void hostcall_missing(void)
+{
+	host_log("gx: the guest called a host function that the host does not have\n");
+	host_exit(127);
+}
+
+static long dispatch(struct gx_frame *f, struct gx_thread *self)
+{
+	long nr = f->x[8];
+	long params[6] = { f->x[0], f->x[1], f->x[2], f->x[3], f->x[4], f->x[5] };
+	int fd = (int)f->x[0];
+
+	/* The kernel has no MMU to stop it at memory the guest cannot use, and
+	 * programs do probe memory with these (Chromium reads into a page it
+	 * made read-only). */
+	switch (nr) {
+	case 63: case 67: case 207:        /* read, pread64, recvfrom */
+		if (!gmem_accessible(f->x[1], f->x[2], 1))
+			return -GX_EFAULT;
+		break;
+	case 64: case 68: case 206:        /* write, pwrite64, sendto */
+		if (!gmem_accessible(f->x[1], f->x[2], 0))
+			return -GX_EFAULT;
+		break;
+	case 261:                          /* prlimit64: the old limit */
+		if (f->x[3] && !gmem_accessible(f->x[3], 16, 1))
+			return -GX_EFAULT;
+		break;
+	case 113: {                        /* clock_gettime */
+		long ret;
+
+		if (!gmem_accessible(f->x[1], 16, 1))
+			return -GX_EFAULT;
+		ret = fast_clock_gettime(f->x[0], (struct lkl_timespec *)f->x[1]);
+		if (ret <= 0)
+			return ret;
+		break;
+	}
+	case 114:                          /* clock_settime: the constants are no more */
+		memset(clock_known, 0, sizeof(clock_known));
+		break;
+	}
+
+	switch (nr) {
+	case 222: return gmem_mmap(f->x[0], f->x[1], (int)f->x[2], (int)f->x[3],
+				   (int)f->x[4], f->x[5]);
+	case 215: return gmem_munmap(f->x[0], f->x[1]);
+	case 226: return gmem_mprotect(f->x[0], f->x[1], (int)f->x[2]);
+	case 214: return gmem_brk(f->x[0]);
+	case 216: return -GX_ENOMEM;       /* mremap: glibc falls back to malloc+copy */
+	case 233: return gmem_madvise(f->x[0], f->x[1], (int)f->x[2]);
+
+	case GX_SYS_HOST_SYMBOL: {
+		void *fn = host_symbol((const char *)f->x[0]);
+
+		if (!fn && gx_trace)
+			host_log("gx: no host function %s\n", (const char *)f->x[0]);
+		return (long)fn;
+	}
+	case GX_SYS_HOSTCALL:
+		return f->x[0] ? (long)hostcall_missing : (long)gx_hostcall;
+
+	case 220: return do_clone(f);
+	case 435: return -GX_ENOSYS;       /* clone3: glibc falls back to clone */
+	case 98:  return do_futex(f, self);
+	case 93:  do_exit_thread(self, (int)f->x[0]); return 0;
+	case 94:
+		if (gx_trace)
+			gmem_report();
+		host_exit((int)f->x[0]);
+		return 0;
+	case 96:  self->clear_tid = (int *)f->x[0]; return self->tid;
+	case 178: return self->tid;        /* gettid */
+	case 172: return 100;              /* getpid */
+	case 173: return 1;                /* getppid */
+	case 99:  return 0;                /* set_robust_list */
+	case 293: return -GX_ENOSYS;       /* rseq */
+	case 124: host_yield(); return 0;  /* sched_yield */
+	/* The kernel does not know the guest's threads by the ids they have
+	 * here: scheduling is the host's business. */
+	case 118: case 119: case 122:      /* sched_setparam, _setscheduler, _setaffinity */
+		return 0;
+	case 120: return 0;                /* sched_getscheduler: SCHED_OTHER */
+	case 121:                          /* sched_getparam */
+		*(int *)f->x[1] = 0;
+		return 0;
+	case 123:                          /* sched_getaffinity */
+		if (f->x[1] < 8)
+			return -GX_EINVAL;
+		*(uint64_t *)f->x[2] = cpus >= 64 ? ~0UL : (1UL << cpus) - 1;
+		return 8;
+
+	case 134:                          /* rt_sigaction */
+	case 135:                          /* rt_sigprocmask */
+	case 132:                          /* sigaltstack */
+		return 0;
+	case 129: case 130: case 131:      /* kill, tkill, tgkill */
+		host_log("gx: the guest raised signal %ld\n",
+			 nr == 131 ? (long)f->x[2] : (long)f->x[1]);
+		host_exit(128 + (int)(nr == 131 ? f->x[2] : f->x[1]));
+		return 0;
+
+	case 78:                           /* readlinkat */
+		if (!strcmp((const char *)f->x[1], "/proc/self/exe")) {
+			size_t len = strlen(gx_exe_path);
+
+			if (len > f->x[3])
+				len = f->x[3];
+			memcpy((void *)f->x[2], gx_exe_path, len);
+			return len;
+		}
+		break;
+	case 279: {                        /* memfd_create */
+		/* The kernel has none without an MMU: an unlinked file of the
+		 * memory filesystem is the same thing. */
+		static int serial;
+		char path[64] = "/dev/shm/gx-memfd-";
+		int n = __atomic_add_fetch(&serial, 1, __ATOMIC_SEQ_CST), at = strlen(path);
+		long mfd;
+
+		if (f->x[1] & ~0x1fUL)     /* programs test for memfd with bad flags */
+			return -GX_EINVAL;
+		for (int digit = 100000000; digit; digit /= 10)
+			path[at++] = '0' + n / digit % 10;
+		path[at] = 0;
+		mfd = lkl_sys_open(path, LKL_O_RDWR | LKL_O_CREAT | LKL_O_EXCL |
+				   ((f->x[1] & 1) ? LKL_O_CLOEXEC : 0), 0600);
+		if (mfd >= 0)
+			lkl_sys_unlink(path);
+		return mfd;
+	}
+	case 46: {                         /* ftruncate */
+		/* The memory filesystem of a kernel without an MMU wants one
+		 * block of memory for a file that grows from nothing: it
+		 * refuses large ones, and fills the others for nothing when
+		 * the file is shared memory, which lives in gmem.c. Growing
+		 * the file by a write of its last byte does neither. */
+		struct lkl_stat st;
+		long ret;
+
+		if ((long)f->x[1] > 0 && !lkl_sys_fstat(fd, &st) && !st.st_size &&
+		    (st.st_mode & LKL_S_IFMT) == LKL_S_IFREG && gmem_in_memory_fs(fd) &&
+		    lkl_sys_pwrite64(fd, "", 1, f->x[1] - 1) == 1)
+			return 0;
+		ret = lkl_syscall(nr, params);
+
+		if ((ret == -27 /* EFBIG */ || ret == -GX_ENOMEM) && (long)f->x[1] > 0 &&
+		    lkl_sys_pwrite64(fd, "", 1, f->x[1] - 1) == 1)
+			ret = 0;
+		return ret;
+	}
+	case 25:                           /* fcntl */
+		if (f->x[1] == 1033 /* F_ADD_SEALS */ || f->x[1] == 1034 /* F_GET_SEALS */)
+			return 0;              /* only memfd has seals */
+		break;
+
+	case 278:                          /* getrandom */
+		/* From the host: the kernel has no source of entropy of its own
+		 * and would make callers wait for some. */
+		host_random((void *)f->x[0], f->x[1]);
+		return f->x[1];
+
+	case 261:                          /* prlimit64 */
+		if (f->x[1] == 3 /* RLIMIT_STACK */ && !f->x[2] && f->x[3]) {
+			uint64_t *lim = (uint64_t *)f->x[3];
+
+			/* Also the default size of thread stacks, which have to be
+			 * committed in full on a host that cannot do it lazily. */
+			lim[0] = 2UL << 20;
+			lim[1] = ~0UL;
+			return 0;
+		}
+		break;
+
+	case 64:                           /* write */
+		if (fd == 1 || fd == 2) {
+			host_console_write(fd, (void *)f->x[1], f->x[2]);
+			return f->x[2];
+		}
+		break;
+	case 66:                           /* writev */
+		if (fd == 1 || fd == 2) {
+			struct gx_iovec *iov = (struct gx_iovec *)f->x[1];
+			long total = 0;
+
+			for (int i = 0; i < (int)f->x[2]; i++) {
+				host_console_write(fd, iov[i].base, iov[i].len);
+				total += iov[i].len;
+			}
+			return total;
+		}
+		break;
+	case 80:                           /* fstat */
+		if (fd >= 0 && fd <= 2) {
+			memset((void *)f->x[1], 0, 128);
+			*(uint32_t *)(f->x[1] + 16) = 0020000 | 0666; /* a tty */
+			return 0;
+		}
+		break;
+	case 79:                           /* newfstatat with AT_EMPTY_PATH */
+		if (fd >= 0 && fd <= 2 && (f->x[3] & 0x1000)) {
+			memset((void *)f->x[2], 0, 128);
+			*(uint32_t *)(f->x[2] + 16) = 0020000 | 0666;
+			return 0;
+		}
+		break;
+	case 29:                           /* ioctl */
+		if (fd >= 0 && fd <= 2)
+			return f->x[1] == 0x5401 /* TCGETS */ ? -GX_ENOTTY : 0;
+		break;
+	case 57:                           /* close */
+		if (fd >= 0 && fd <= 2)
+			return 0;
+		break;
+	case 56:                           /* openat */
+		params[2] = translate_open_flags(params[2]);
+		break;
+	}
+	return lkl_syscall(nr, params);
+}
+
+static uint64_t syscall_count;
+
+static uint64_t reported_at;
+
+/* One line per thread that did something since the last report: how much of
+ * a processor it used, how many syscalls it made, and where it is now. */
+static void report_thread(struct gx_thread *t, uint64_t elapsed)
+{
+	uint64_t cpu = t->host_id ? host_thread_cpu_ns(t->host_id) : 0;
+	uint64_t used = cpu - t->reported_cpu_ns, calls = t->syscalls - t->reported_syscalls;
+	long nr = t->nr;
+
+	t->reported_cpu_ns = cpu;
+	t->reported_syscalls = t->syscalls;
+	if (elapsed && used * 100 / elapsed < 1 && !calls)
+		return;
+	host_log("  [%d] %-15s %3lu%% of a processor, %6lu syscalls, now in ", t->tid,
+		 t->name[0] ? t->name : "-", elapsed ? (unsigned long)(used * 100 / elapsed) : 0,
+		 (unsigned long)calls);
+	if (nr < 0)
+		host_log("its own code\n");
+	else
+		host_log("syscall %ld(%#lx, %#lx, %#lx)\n", nr, (unsigned long)t->args[0],
+			 (unsigned long)t->args[1], (unsigned long)t->args[2]);
+}
+
+void gx_report_threads(void)
+{
+	uint64_t now = host_now_ns(), elapsed = reported_at ? now - reported_at : 0;
+
+	reported_at = now;
+	host_log("gx: %lu syscalls so far, %d threads; the busy ones:\n",
+		 (unsigned long)__atomic_load_n(&syscall_count, __ATOMIC_RELAXED), live_threads);
+	if (gx_main_thread)
+		report_thread(gx_main_thread, elapsed);
+	for (int i = 0; i < GX_MAX_THREADS; i++)
+		if (thread_used[i])
+			report_thread(&threads[i], elapsed);
+}
+
+long gx_do_syscall(struct gx_frame *f)
+{
+	struct gx_thread *self = (struct gx_thread *)f->ctx;
+	long ret;
+
+	for (int i = 0; i < 4; i++)
+		self->args[i] = f->x[i];
+	self->nr = f->x[8];
+	self->syscalls++;
+	if (!self->host_id)
+		self->host_id = host_thread_self();
+	if (f->x[8] == 167 && f->x[0] == 15 /* prctl(PR_SET_NAME) */ && f->x[1]) {
+		strncpy(self->name, (const char *)f->x[1], sizeof(self->name) - 1);
+		self->name[sizeof(self->name) - 1] = 0;
+	}
+	__atomic_add_fetch(&syscall_count, 1, __ATOMIC_RELAXED);
+	ret = dispatch(f, self);
+	self->nr = -1;
+
+	if (gx_trace) {
+		if (f->x[8] == 56 || f->x[8] == 48 || f->x[8] == 78)
+			host_log("[%d] sys %ld(%ld, \"%s\", %#lx) = %ld\n", self->tid,
+				 (long)f->x[8], (long)f->x[0], (char *)f->x[1],
+				 (unsigned long)f->x[2], ret);
+		else
+			host_log("[%d] sys %ld(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx) = %#lx\n",
+				 self->tid, (long)f->x[8], (unsigned long)f->x[0],
+				 (unsigned long)f->x[1], (unsigned long)f->x[2],
+				 (unsigned long)f->x[3], (unsigned long)f->x[4],
+				 (unsigned long)f->x[5], (unsigned long)ret);
+	}
+	return ret;
+}
