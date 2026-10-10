@@ -28,8 +28,8 @@ echo "== gx"
 # finds the loader and the libraries in the arm64 packages of the image.
 $CC -O2 -g -Wall -Wextra -Wno-unused-parameter -DGX_ARENA_SIZE='(256UL << 30)' \
 	-I"$LKL/include" -I"$SRC" \
-	"$SRC"/tramp.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/host_posix.c \
-	"$LKL/liblkl.a" -lpthread -lrt -ldl \
+	"$SRC"/tramp.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/host_posix.c \
+	"$LKL/liblkl.a" -lavcodec -lavutil -lpthread -lrt -ldl \
 	-o "$OUT/gx" || exit 1
 
 echo "== sysroot"
@@ -39,6 +39,12 @@ done
 for t in $TESTS net; do
 	$CC -O2 -g -Wall -pthread "$SRC/tests/$t.c" -ldl -o "$SYSROOT/bin/$t" || exit 1
 done
+
+# libgxvideo for the guest, loaded ahead of a browser: its H.264 decoder
+# becomes the host's (guest/video.c, video.c).
+printf 'GX_THUNK(gx_video_%s)\n' available open send receive copy flush close >"$OUT/video.list"
+$CC -O2 -g -Wall -shared -fPIC -Wl,-soname,libgxvideo.so -DGX_LIST="\"$OUT/video.list\"" \
+	"$SRC/guest/hostlib.c" "$SRC/guest/video.c" -o "$SYSROOT/lib/libgxvideo.so" || exit 1
 
 # libEGL and libGLESv2 for the guest: thunks to the host's, one per function
 # the Khronos headers declare.

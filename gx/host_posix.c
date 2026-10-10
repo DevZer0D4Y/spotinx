@@ -44,6 +44,7 @@
 #include "cdp.h"
 #include "wl.h"
 #include "glwin.h"
+#include "video.h"
 
 static void export_file(void);
 static const char *export_spec;
@@ -628,6 +629,8 @@ void *host_symbol(const char *name)
 
 	if (!strncmp(name, "gx_audio_", 9))
 		return audio_symbol(name);
+	if (!strncmp(name, "gx_video_", 9))
+		return video_symbol(name);
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
 	pthread_once(&gl_once, gl_open);

@@ -67,6 +67,9 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 		[ ! -e "$OUT/sysroot/lib/$lib" ] || cp "$OUT/sysroot/lib/$lib" "$ROOT/lib/" || exit 1
 	done
 	[ ! -e $ARM64_LIB/libwayland-egl.so.1 ] || cp -L $ARM64_LIB/libwayland-egl.so.1 "$ROOT/lib/" || exit 1
+	# For video decoded by the host: what takes over the browser's H.264
+	# decoder (LD_PRELOAD), and a page with a video to try it on.
+	[ ! -e "$OUT/sysroot/lib/libgxvideo.so" ] || cp "$OUT/sysroot/lib/libgxvideo.so" "$ROOT/lib/" || exit 1
 	# For sound: gx's libasound (guest/asound.c) in place of ALSA's, with
 	# every function the programs import. The ones it does not have say
 	# that there is nothing: a size for what asks one, "no such thing" for
@@ -107,6 +110,11 @@ GX_THUNK(gx_audio_drop) GX_THUNK(gx_audio_close)' | tr ' ' '\n' >"$A/host.list"
 	# The key map gx's Wayland display hands out (wl.c), a standard one.
 	if command -v xkbcli >/dev/null; then
 		xkbcli compile-keymap --layout us >"$ROOT/usr/share/gx/keymap.xkb" || exit 1
+	fi
+	if [ -e "$OUT/media/test.mp4" ]; then
+		cp "$OUT/media/test.mp4" "$ROOT/usr/share/gx/test.mp4"
+		echo '<body style="margin:0;background:#000"><video src="test.mp4" autoplay muted loop style="width:100%"></video>' \
+			>"$ROOT/usr/share/gx/video.html"
 	fi
 	cat >"$ROOT/usr/share/gx/page.html" <<'EOF'
 <!doctype html><html><head><title>gx page</title>
@@ -177,7 +185,7 @@ if [ "${1:-}" = full ]; then
 	[ -z "${GX_FRESH:-}" ] || rm -f "$OUT/profile-pc.ext4"
 	[ -e "$OUT/profile-pc.ext4" ] || cp "$OUT/profile.ext4" "$OUT/profile-pc.ext4" || exit 1
 	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -b -A $FULL_ADDRESS \
-		-p "$OUT/profile-pc.ext4" \
+		-p "$OUT/profile-pc.ext4" -e LD_PRELOAD=/lib/libgxvideo.so \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$OUT/chromium-full-switch.ext4" \
 		/usr/lib/chromium/chromium $FULL_FLAGS $gpu ${GX_JS---js-flags=--jitless} \
 		"${@:-file:///usr/share/gx/page.html}"

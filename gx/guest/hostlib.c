@@ -48,7 +48,8 @@ static const struct {
 };
 #undef GX_THUNK
 
-__attribute__((constructor)) static void bind_thunks(void)
+/* Before the constructors of what is built with this (they call the thunks). */
+__attribute__((constructor(101))) static void bind_thunks(void)
 {
 	void *missing = (void *)syscall(GX_SYS_HOSTCALL, 1);
 

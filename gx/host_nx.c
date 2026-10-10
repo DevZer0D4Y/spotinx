@@ -53,6 +53,7 @@
 #include "cdp.h"
 #include "wl.h"
 #include "glwin.h"
+#include "video.h"
 
 /* Where everything is on the SD card: the root image next to the program, the
  * log, and programs.txt if there is to be a menu. */
@@ -1341,6 +1342,8 @@ void *host_symbol(const char *name)
 		return gx_audio_drop;
 	if (!strcmp(name, "gx_audio_close"))
 		return gx_audio_close;
+	if (!strncmp(name, "gx_video_", 9))
+		return video_symbol(name);
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
 	glwin_init(&gl_host);
@@ -2184,6 +2187,9 @@ static void run(void *arg)
 {
 	static char *guest_env[] = {
 		"PATH=/bin:/usr/bin", "HOME=/root", "LD_LIBRARY_PATH=/lib", "TMPDIR=/tmp",
+		/* A browser's H.264 goes to the console's decoder (guest/video.c);
+		 * a root without the library says so and goes on. */
+		"LD_PRELOAD=/lib/libgxvideo.so",
 		/* Where wl.c is, for the programs that look for a display. */
 		"XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0", NULL,
 	};
