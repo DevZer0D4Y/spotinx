@@ -418,21 +418,18 @@ static size_t page_of(void *addr) { return ((uint8_t *)addr - arena) / GX_PAGE; 
 
 static size_t pool_take(size_t n, size_t *first)
 {
-	if (n >= POOL_LARGE) {
-		for (size_t p = pool_pages & ~(size_t)(POOL_LARGE - 1); p >= POOL_LARGE;) {
-			size_t run = 0;
-
-			p -= POOL_LARGE;
-			if (pool_used[p] || pool_used[p + POOL_LARGE - 1])
-				continue;
-			while (run < n && p + run < pool_pages && !pool_used[p + run])
-				run++;
-			if (run < POOL_LARGE)
-				continue;
-			memset(&pool_used[p], 1, run);
-			pool_free -= run;
-			*first = p;
-			return run;
+	if (n >= POOL_LARGE && n <= pool_pages) {
+		/* All of it in one run, the highest there is; in pieces as for
+		 * small ones if the pool has no such run left. */
+		for (size_t p = (pool_pages - n) & ~(size_t)(POOL_LARGE - 1);; p -= POOL_LARGE) {
+			if (!pool_used[p] && !pool_used[p + n - 1] && !memchr(&pool_used[p], 1, n)) {
+				memset(&pool_used[p], 1, n);
+				pool_free -= n;
+				*first = p;
+				return n;
+			}
+			if (p < POOL_LARGE)
+				break;
 		}
 	}
 	for (int pass = 0; pass < 2; pass++) {
