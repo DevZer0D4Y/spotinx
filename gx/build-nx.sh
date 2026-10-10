@@ -137,6 +137,13 @@ if [ -e "$PC_OUT/chromium.ext4" ]; then
 		# thing. The entries after it are the older way, pictures over the
 		# debugging pipe of the headless one.
 		W="-w @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --ozone-platform=wayland"
+		# The same drawing with the GPU: ANGLE inside Chromium, on the
+		# console's own EGL and GLES through gx's libEGL and libGLESv2.
+		G="${W/--disable-gpu/--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu}"
+		echo "[Chromium GPU: the test page] $G file:///usr/share/gx/page.html"
+		echo "[Chromium GPU: speed test] $G $A"
+		echo "[Chromium GPU: wikipedia.org] $G https://www.wikipedia.org/"
+		echo "[Chromium GPU: google.com] $G https://www.google.com/"
 		echo "[Chromium WINDOW: google.com] $W https://www.google.com/"
 		echo "[Chromium WINDOW: wikipedia.org] $W https://www.wikipedia.org/"
 		echo "[Chromium WINDOW: speed test] $W $A"

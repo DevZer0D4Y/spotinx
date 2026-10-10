@@ -854,6 +854,10 @@ static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, voi
 {
 	console_off();
 	window_surface = eglCreateWindowSurface(dpy, config, nwindowGetDefault(), NULL);
+	if (window_surface == EGL_NO_SURFACE)
+		host_log("gx: gl: no window surface (%#x)\n", eglGetError());
+	else
+		host_log("gx: gl: the guest has the screen\n");
 	return window_surface;
 }
 
@@ -880,6 +884,98 @@ static EGLBoolean gl_terminate(EGLDisplay dpy)
 	return ret;
 }
 
+/* What follows only watches: a guest that draws with the GPU (a Chromium told
+ * to) says little about why it gave up, and the log is all there is to go by. */
+static volatile unsigned gl_swaps;
+
+static EGLBoolean gl_swap_buffers(EGLDisplay dpy, EGLSurface surface)
+{
+	EGLBoolean ret = eglSwapBuffers(dpy, surface);
+
+	if (!ret && !gl_swaps)
+		host_log("gx: gl: eglSwapBuffers failed (%#x)\n", eglGetError());
+	gl_swaps++;
+	return ret;
+}
+
+/* With the parts that changed: the whole of it is shown all the same. */
+static EGLBoolean gl_swap_buffers_with_damage(EGLDisplay dpy, EGLSurface surface,
+					      const EGLint *rects, EGLint count)
+{
+	return gl_swap_buffers(dpy, surface);
+}
+
+static EGLBoolean gl_initialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
+{
+	EGLBoolean ret = eglInitialize(dpy, major, minor);
+
+	if (!ret)
+		host_log("gx: gl: eglInitialize failed (%#x)\n", eglGetError());
+	else
+		host_log("gx: gl: EGL %s, %s\n", eglQueryString(dpy, EGL_VERSION),
+			 eglQueryString(dpy, EGL_EXTENSIONS));
+	return ret;
+}
+
+static EGLBoolean gl_choose_config(EGLDisplay dpy, const EGLint *attribs, EGLConfig *configs,
+				   EGLint size, EGLint *count)
+{
+	EGLBoolean ret = eglChooseConfig(dpy, attribs, configs, size, count);
+
+	if (!ret || (count && !*count)) {
+		host_log("gx: gl: eglChooseConfig found nothing (%#x) for", ret ? 0 : eglGetError());
+		for (int i = 0; attribs && attribs[i] != EGL_NONE && i < 40; i += 2)
+			host_log(" %#x=%#x", attribs[i], attribs[i + 1]);
+		host_log("\n");
+	}
+	return ret;
+}
+
+static EGLContext gl_create_context(EGLDisplay dpy, EGLConfig config, EGLContext share,
+				    const EGLint *attribs)
+{
+	EGLContext ret = eglCreateContext(dpy, config, share, attribs);
+
+	if (ret == EGL_NO_CONTEXT) {
+		host_log("gx: gl: eglCreateContext failed (%#x) for", eglGetError());
+		for (int i = 0; attribs && attribs[i] != EGL_NONE && i < 40; i += 2)
+			host_log(" %#x=%#x", attribs[i], attribs[i + 1]);
+		host_log("\n");
+	}
+	return ret;
+}
+
+static EGLSurface gl_create_pbuffer_surface(EGLDisplay dpy, EGLConfig config, const EGLint *attribs)
+{
+	EGLSurface ret = eglCreatePbufferSurface(dpy, config, attribs);
+
+	if (ret == EGL_NO_SURFACE)
+		host_log("gx: gl: eglCreatePbufferSurface failed (%#x)\n", eglGetError());
+	return ret;
+}
+
+static EGLBoolean gl_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext context)
+{
+	static int said, failures;
+	EGLBoolean ret = eglMakeCurrent(dpy, draw, read, context);
+
+	if (!ret && failures++ < 8) {
+		host_log("gx: gl: eglMakeCurrent failed (%#x), surface %p, context %p\n",
+			 eglGetError(), draw, context);
+	} else if (ret && context != EGL_NO_CONTEXT && !said) {
+		said = 1;
+		host_log("gx: gl: %s, %s\n", (const char *)glGetString(GL_RENDERER),
+			 (const char *)glGetString(GL_VERSION));
+	}
+	return ret;
+}
+
+/* The driver would call the guest's function from the host's side of things,
+ * which cannot be done (see gx_hostcall): it gets no messages. */
+static void gl_debug_message_callback(void *callback, const void *param)
+{
+}
+
 void *host_symbol(const char *name)
 {
 	static const struct {
@@ -894,6 +990,16 @@ void *host_symbol(const char *name)
 		{ "eglCreatePlatformWindowSurfaceEXT", gl_create_window_surface },
 		{ "eglQuerySurface", gl_query_surface },
 		{ "eglTerminate", gl_terminate },
+		{ "eglSwapBuffers", gl_swap_buffers },
+		{ "eglSwapBuffersWithDamageKHR", gl_swap_buffers_with_damage },
+		{ "eglSwapBuffersWithDamageEXT", gl_swap_buffers_with_damage },
+		{ "eglInitialize", gl_initialize },
+		{ "eglChooseConfig", gl_choose_config },
+		{ "eglCreateContext", gl_create_context },
+		{ "eglCreatePbufferSurface", gl_create_pbuffer_surface },
+		{ "eglMakeCurrent", gl_make_current },
+		{ "glDebugMessageCallback", gl_debug_message_callback },
+		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 	};
 
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
@@ -1251,6 +1357,9 @@ void host_present(const uint8_t *pixels, int width, int height, int stride)
 	static u8 *packed;
 	static int room;
 
+	/* The screen is the guest's own once it draws with the GPU. */
+	if (window_surface != EGL_NO_SURFACE)
+		return;
 	if (stride != width * 4) {
 		/* GLES 2 takes rows that follow each other. */
 		if (width * height * 4 > room) {
@@ -1703,11 +1812,17 @@ static void report_kernel_use(void)
  * process costs: a guest that hangs leaves nothing else to go by. */
 static void watchdog(void *arg)
 {
+	unsigned swaps = 0;
+
 	for (int seconds = 10;; seconds += 10) {
 		svcSleepThread(10000000000ULL);
 		if (finished)
 			break;
 		host_log("gx: after %d s\n", seconds);
+		if (gl_swaps != swaps) {
+			host_log("gx: gl: %u pictures in 10 s\n", gl_swaps - swaps);
+			swaps = gl_swaps;
+		}
 		report_kernel_use();
 		gx_report_kernel_memory();
 		gx_report_threads();

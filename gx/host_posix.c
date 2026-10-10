@@ -364,6 +364,18 @@ static unsigned gl_choose_config(void *dpy, const int32_t *attribs, void **confi
 	return choose(dpy, copy, configs, size, count);
 }
 
+/* And when it asks what a configuration can do, one that can make an
+ * off-screen buffer can make "a window", since that is what a window is here. */
+static unsigned gl_get_config_attrib(void *dpy, void *config, int32_t attribute, int32_t *value)
+{
+	unsigned (*get)(void *, void *, int32_t, int32_t *) = gl_real("eglGetConfigAttrib");
+	unsigned ret = get(dpy, config, attribute, value);
+
+	if (ret && attribute == EGL_SURFACE_TYPE && (*value & EGL_PBUFFER_BIT))
+		*value |= EGL_WINDOW_BIT;
+	return ret;
+}
+
 static void *gl_create_window_surface(void *dpy, void *config, void *window, const void *attribs)
 {
 	static const int32_t screen[] = {
@@ -407,6 +419,12 @@ static void save_frame(const char *path, void *dpy, void *surface)
 	free(pixels);
 }
 
+/* The driver would call the guest's function from the host's side of things,
+ * which cannot be done (see gx_hostcall): it gets no messages. */
+static void gl_debug_message_callback(void *callback, const void *param)
+{
+}
+
 static unsigned gl_swap_buffers(void *dpy, void *surface)
 {
 	unsigned (*swap)(void *, void *) = gl_real("eglSwapBuffers");
@@ -427,10 +445,13 @@ void *host_symbol(const char *name)
 		{ "eglGetPlatformDisplay", gl_get_platform_display },
 		{ "eglGetPlatformDisplayEXT", gl_get_platform_display },
 		{ "eglChooseConfig", gl_choose_config },
+		{ "eglGetConfigAttrib", gl_get_config_attrib },
 		{ "eglCreateWindowSurface", gl_create_window_surface },
 		{ "eglCreatePlatformWindowSurface", gl_create_window_surface },
 		{ "eglCreatePlatformWindowSurfaceEXT", gl_create_window_surface },
 		{ "eglSwapBuffers", gl_swap_buffers },
+		{ "glDebugMessageCallback", gl_debug_message_callback },
+		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 	};
 	void *(*get_proc)(const char *);
 	void *fn;

@@ -46,6 +46,13 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 		cp -L "$lib" "$ROOT/lib/" || exit 1
 	done
 	cp -L $ARM64_LD "$ROOT/lib/ld-linux-aarch64.so.1" || exit 1
+	# For rendering with the GPU (GX_GPU=1 below): gx's EGL and GLES, which
+	# are the host's (build-pc.sh makes them), and the small library a
+	# Wayland client makes its GL window with.
+	for lib in libEGL.so.1 libGLESv2.so.2; do
+		[ ! -e "$OUT/sysroot/lib/$lib" ] || cp "$OUT/sysroot/lib/$lib" "$ROOT/lib/" || exit 1
+	done
+	[ ! -e $ARM64_LIB/libwayland-egl.so.1 ] || cp -L $ARM64_LIB/libwayland-egl.so.1 "$ROOT/lib/" || exit 1
 
 	cp -rL /usr/share/fonts/truetype "$ROOT/usr/share/fonts/" || exit 1
 	cp -rL /etc/fonts "$ROOT/etc/" || exit 1
@@ -83,10 +90,14 @@ if [ "${1:-}" = wayland ]; then
 	rm -rf "$OUT/chromium-frames"
 	mkdir -p "$OUT/chromium-frames"
 	export GX_FRAMES=$OUT/chromium-frames GX_INPUT=${GX_INPUT:-}
+	# GX_GPU=1: Chromium draws with GLES (through ANGLE's GLES backend and
+	# gx's thunk libraries) instead of with the processor. An experiment.
+	gpu="--disable-gpu"
+	[ -z "${GX_GPU:-}" ] || gpu="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu ${GX_GPU_FLAGS:-}"
 	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$IMAGE" \
 		/usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote \
-		--disable-gpu --js-flags=--jitless --ozone-platform=wayland \
+		$gpu --js-flags=--jitless --ozone-platform=wayland \
 		"${@:-file:///usr/share/gx/page.html}"
 fi
 if [ "${1:-}" = browse ]; then
