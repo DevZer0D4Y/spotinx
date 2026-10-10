@@ -53,6 +53,33 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 		[ ! -e "$OUT/sysroot/lib/$lib" ] || cp "$OUT/sysroot/lib/$lib" "$ROOT/lib/" || exit 1
 	done
 	[ ! -e $ARM64_LIB/libwayland-egl.so.1 ] || cp -L $ARM64_LIB/libwayland-egl.so.1 "$ROOT/lib/" || exit 1
+	# For sound: gx's libasound (guest/asound.c) in place of ALSA's, with
+	# every function the programs import. The ones it does not have say
+	# that there is nothing: a size for what asks one, "no such thing" for
+	# what opens something, "not there" for the rest.
+	CC=aarch64-linux-gnu-gcc
+	A=$OUT/asound
+	mkdir -p "$A"
+	for bin in $CHROMIUM $SHELL_BIN; do
+		aarch64-linux-gnu-readelf --dyn-syms -W "$bin"
+	done | awk '$7 == "UND" && $8 ~ /^snd_/ { sub(/ \([0-9]+\)$/, ""); print $8 }' | sort -u >"$A/imports"
+	echo 'GX_THUNK(gx_audio_open) GX_THUNK(gx_audio_write) GX_THUNK(gx_audio_queued)
+GX_THUNK(gx_audio_drop) GX_THUNK(gx_audio_close)' | tr ' ' '\n' >"$A/host.list"
+	$CC -O2 -g -Wall -fPIC -c "$SRC/guest/asound.c" -o "$A/asound.o" || exit 1
+	$CC -O2 -g -Wall -fPIC -DGX_LIST="\"$A/host.list\"" -c "$SRC/guest/hostlib.c" -o "$A/host.o" || exit 1
+	aarch64-linux-gnu-nm --defined-only "$A/asound.o" | awk '{ print $3 }' >"$A/have"
+	sed 's/@.*//' "$A/imports" | grep -vxFf "$A/have" | awk '
+		/_sizeof$/ { print "unsigned long " $0 "(void) { return 64; }"; next }
+		/_open$/   { print "long " $0 "(void) { return -2; }"; next }
+		           { print "long " $0 "(void) { return -38; }" }' >"$A/rest.c"
+	# The programs ask for the functions by version, as ALSA has them; one
+	# asked for without a version is given the first.
+	awk -F@ '{ v = $2 == "" ? "ALSA_0.9" : $2; names[v] = names[v] " " $1 ";" }
+		END { for (v in names) print v " { global:" names[v] (v == "ALSA_0.9" ? " local: *;" : "") " };" }' \
+		"$A/imports" >"$A/versions"
+	grep -q "^ALSA_0.9 " "$A/versions" || { echo "no ALSA functions found in the programs"; exit 1; }
+	$CC -shared -Wl,-soname,libasound.so.2 -Wl,--version-script="$A/versions" \
+		"$A/asound.o" "$A/host.o" "$A/rest.c" -o "$ROOT/lib/libasound.so.2" || exit 1
 
 	cp -rL /usr/share/fonts/truetype "$ROOT/usr/share/fonts/" || exit 1
 	cp -rL /etc/fonts "$ROOT/etc/" || exit 1
@@ -79,6 +106,21 @@ EOF
 	rm -f "$IMAGE"
 	mke2fs -q -t ext4 -O ^has_journal -d "$ROOT" "$IMAGE" "${size}M" || exit 1
 	echo "$IMAGE: ${size} MB"
+
+	# The same for the console, without what only the tests here use: the
+	# Chromium without a window, and the graphics drivers that draw with the
+	# processor (the console has its own, or none is used).
+	SLIM=$OUT/chromium-switch-root
+	rm -rf "$SLIM"
+	cp -al "$ROOT" "$SLIM" || exit 1
+	rm -f "$SLIM"/usr/lib/chromium/{chromium-headless-shell,libvk_swiftshader.so,vk_swiftshader_icd.json} \
+		"$SLIM"/usr/lib/chromium/{libVkLayer_khronos_validation.so,libtest_trace_processor.so,libvulkan.so.1} \
+		"$SLIM"/usr/lib/chromium/{chromium,chrome_crashpad_handler}
+	size=$(( $(du -sm "$SLIM" | cut -f1) * 21 / 20 + 16 ))
+	rm -f "$OUT/chromium-switch.ext4"
+	mke2fs -q -t ext4 -O ^has_journal -d "$SLIM" "$OUT/chromium-switch.ext4" "${size}M" || exit 1
+	rm -rf "$SLIM"
+	echo "$OUT/chromium-switch.ext4: ${size} MB"
 fi
 
 echo "== chromium"
@@ -94,10 +136,11 @@ if [ "${1:-}" = wayland ]; then
 	# gx's thunk libraries) instead of with the processor. An experiment.
 	gpu="--disable-gpu"
 	[ -z "${GX_GPU:-}" ] || gpu="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu ${GX_GPU_FLAGS:-}"
-	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w \
+	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -b \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$IMAGE" \
 		/usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote \
-		$gpu ${GX_JS---js-flags=--jitless} --ozone-platform=wayland \
+		$gpu ${GX_JS---js-flags=--jitless} --ozone-platform=wayland --enable-spatial-navigation \
+		--autoplay-policy=no-user-gesture-required --remote-debugging-pipe \
 		"${@:-file:///usr/share/gx/page.html}"
 fi
 if [ "${1:-}" = browse ]; then

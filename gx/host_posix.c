@@ -435,6 +435,104 @@ static unsigned gl_swap_buffers(void *dpy, void *surface)
 	return swap(dpy, surface);
 }
 
+/* ---------- host functions for the guest: sound ---------- */
+
+/*
+ * What the guest's libasound (guest/asound.c) plays. There is nothing to hear
+ * here: the samples go to the file GX_AUDIO names, if it names one, and are
+ * counted as played at the pace a sound card would play them.
+ */
+static pthread_mutex_t audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *audio_file;
+static long audio_rate;
+static uint64_t audio_written, audio_loud, audio_start_ns;
+
+static long audio_queued_locked(void)
+{
+	uint64_t played = audio_rate ? (host_now_ns() - audio_start_ns) * audio_rate / 1000000000ULL : 0;
+
+	if (played >= audio_written) {
+		/* All of it is played: what comes next starts from now. */
+		audio_start_ns = host_now_ns() - audio_written * 1000000000ULL / (audio_rate ? audio_rate : 1);
+		return 0;
+	}
+	return audio_written - played;
+}
+
+static long gx_audio_open(long rate, long channels)
+{
+	const char *path = getenv("GX_AUDIO");
+
+	if (channels != 2 || rate <= 0)
+		return -1;
+	pthread_mutex_lock(&audio_lock);
+	audio_rate = rate;
+	audio_written = 0;
+	audio_start_ns = host_now_ns();
+	if (path && !audio_file)
+		audio_file = fopen(path, "wb");
+	pthread_mutex_unlock(&audio_lock);
+	fprintf(stderr, "gx: audio: %ld Hz\n", rate);
+	return 0;
+}
+
+static long gx_audio_write(const int16_t *frames, long count)
+{
+	pthread_mutex_lock(&audio_lock);
+	audio_queued_locked();
+	audio_written += count;
+	for (long i = 0; i < count * 2; i++)
+		audio_loud += frames[i] > 256 || frames[i] < -256;
+	if (audio_file)
+		fwrite(frames, 4, count, audio_file);
+	pthread_mutex_unlock(&audio_lock);
+	return count;
+}
+
+static long gx_audio_queued(void)
+{
+	long queued;
+
+	pthread_mutex_lock(&audio_lock);
+	queued = audio_queued_locked();
+	pthread_mutex_unlock(&audio_lock);
+	return queued;
+}
+
+static void gx_audio_drop(void)
+{
+	pthread_mutex_lock(&audio_lock);
+	audio_start_ns = host_now_ns() - audio_written * 1000000000ULL / (audio_rate ? audio_rate : 1);
+	pthread_mutex_unlock(&audio_lock);
+}
+
+static void gx_audio_close(void)
+{
+	pthread_mutex_lock(&audio_lock);
+	if (audio_file)
+		fflush(audio_file);
+	pthread_mutex_unlock(&audio_lock);
+	fprintf(stderr, "gx: audio: closed after %lu frames, %lu samples that were not silence\n",
+		(unsigned long)audio_written, (unsigned long)audio_loud);
+}
+
+static void *audio_symbol(const char *name)
+{
+	static const struct {
+		const char *name;
+		void *fn;
+	} ours[] = {
+		{ "gx_audio_open", gx_audio_open },   { "gx_audio_write", gx_audio_write },
+		{ "gx_audio_queued", gx_audio_queued }, { "gx_audio_drop", gx_audio_drop },
+		{ "gx_audio_close", gx_audio_close },
+	};
+
+	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
+		if (!strcmp(name, ours[i].name))
+			return ours[i].fn;
+	return NULL;
+}
+
 void *host_symbol(const char *name)
 {
 	static const struct {
@@ -456,6 +554,8 @@ void *host_symbol(const char *name)
 	void *(*get_proc)(const char *);
 	void *fn;
 
+	if (!strncmp(name, "gx_audio_", 9))
+		return audio_symbol(name);
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
 	pthread_once(&gl_once, gl_open);
@@ -636,6 +736,10 @@ int host_input(struct cdp_input *in)
 		queue[queued++].type = CDP_BACK;
 	} else if (!strcmp(action, "reload")) {
 		queue[queued++].type = CDP_RELOAD;
+	} else if (sscanf(action, "key %d", &x1) == 1) {
+		queue[queued++] = (struct cdp_input){ CDP_KEY, x1, 0, "" };
+	} else if (!strcmp(action, "activate")) {
+		queue[queued++].type = CDP_ACTIVATE;
 	} else if (!strcmp(action, "enter")) {
 		queue[queued++].type = CDP_ENTER;
 	} else if (!strcmp(action, "edit")) {
@@ -949,12 +1053,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "gx: cannot reserve the guest address space\n");
 		return 1;
 	}
-	if (wayland && wl_start()) {
-		fprintf(stderr, "gx: cannot open the Wayland display\n");
+	/* The pipe first: it wants the descriptors Chromium knows it by. */
+	if (browser && cdp_start(wayland)) {
+		fprintf(stderr, "gx: cannot set up the pipe to Chromium\n");
 		return 1;
 	}
-	if (browser && cdp_start()) {
-		fprintf(stderr, "gx: cannot set up the pipe to Chromium\n");
+	if (wayland && wl_start()) {
+		fprintf(stderr, "gx: cannot open the Wayland display\n");
 		return 1;
 	}
 	sa.sa_sigaction = on_fault;

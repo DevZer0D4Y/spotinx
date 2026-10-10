@@ -52,7 +52,16 @@
 #include "cdp.h"
 #include "wl.h"
 
-#define GX_DIR "sdmc:/gx"
+/* Where everything is on the SD card: the root image next to the program, the
+ * log, and programs.txt if there is to be a menu. */
+#define GX_DIR "sdmc:/switch/chromium-nx"
+/* What runs when there is no programs.txt: Chromium with its window (-w) and
+ * the debugging pipe (-b), drawing with the GPU, V8 with its compilers. */
+#define DEFAULT_COMMAND \
+	"-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process " \
+	"--no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist " \
+	"--disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland " \
+	"--enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on
  * a busy site went through 192 MB and the kernel panicked. */
@@ -111,11 +120,17 @@ static void console_back(void)
 
 /* ---------- console, logging ---------- */
 
+/* Where the thread that has print_lock is, for the watchdog to tell when it
+ * never lets go: 1 the console, 2 the log, 3 the card. */
+static volatile int print_stage;
+
 void host_console_write(int fd, const void *buf, size_t len)
 {
 	mutexLock(&print_lock);
+	print_stage = 1;
 	if (console_on)
 		fwrite(buf, 1, len, stdout);
+	print_stage = 2;
 	if (log_file) {
 		static u64 synced;
 		u64 now = armGetSystemTick();
@@ -124,11 +139,20 @@ void host_console_write(int fd, const void *buf, size_t len)
 		fflush(log_file);
 		/* What is not committed to the card is lost if the console is
 		 * switched off or the program is killed. */
-		if (armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
+		static u64 started;
+
+		/* Every line while things start: a start that hangs is seen
+		 * once in a while, and its last lines are what tells where. */
+		if (!started)
+			started = now;
+		if (armTicksToNs(now - started) < 20000000000ULL ||
+		    armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
+			print_stage = 3;
 			fsync(fileno(log_file));
 			synced = now;
 		}
 	}
+	print_stage = 0;
 	mutexUnlock(&print_lock);
 }
 
@@ -712,6 +736,8 @@ struct start {
 static struct start *ended;
 static Mutex ended_lock;
 
+static void forget_thread(Handle handle);
+
 static void bury_threads(void)
 {
 	struct start *s;
@@ -725,6 +751,7 @@ static void bury_threads(void)
 
 		/* It is on its way out, if not out already. */
 		threadWaitForExit(&s->thread);
+		forget_thread(s->thread.handle);
 		threadClose(&s->thread);
 		free(s);
 		s = next;
@@ -732,6 +759,32 @@ static void bury_threads(void)
 }
 
 static int next_core;
+
+/* Every thread of the process, by its handle: when everything stops, where
+ * each of them is is all there is to go by (see report_stuck()). */
+#define MAX_KNOWN 512
+static struct {
+	Handle handle;
+	const char *what;
+} known[MAX_KNOWN];
+static int known_count;
+
+static void know_thread(Handle handle, const char *what)
+{
+	int slot = __atomic_fetch_add(&known_count, 1, __ATOMIC_SEQ_CST);
+
+	if (slot < MAX_KNOWN) {
+		known[slot].what = what;
+		known[slot].handle = handle;
+	}
+}
+
+static void forget_thread(Handle handle)
+{
+	for (int i = 0; i < known_count && i < MAX_KNOWN; i++)
+		if (known[i].handle == handle)
+			known[i].handle = 0;
+}
 
 static void thread_start(void *p)
 {
@@ -758,6 +811,7 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 		 * at a time, while the other cores sit idle (Chromium ran at 28
 		 * frames a second with no thread above 40% of a processor). */
 		svcSetThreadCoreMask(s->thread.handle, core, 0x7);
+		know_thread(s->thread.handle, "ours");
 		rc = threadStart(&s->thread);
 		if (R_FAILED(rc))
 			threadClose(&s->thread);
@@ -1010,6 +1064,148 @@ static void gl_debug_message_callback(void *callback, const void *param)
 {
 }
 
+/* ---------- host functions for the guest: sound ---------- */
+
+/*
+ * What the guest's libasound (guest/asound.c) plays goes to the console's
+ * audio output: 48000 frames a second of two samples of 16 bits, which is
+ * also what a browser asks for. The guest's thread leaves the frames in a
+ * ring; a thread of ours hands them to the system a chunk at a time, keeping
+ * a couple of chunks ahead of what is being played.
+ */
+#define AUDIO_RING 16384                /* frames: a third of a second */
+#define AUDIO_CHUNK 1024                /* frames: a page of memory, as the system wants */
+#define AUDIO_CHUNKS 4
+#define AUDIO_AHEAD 3
+
+static Mutex audio_lock;
+static s16 audio_ring[AUDIO_RING * 2];
+static u64 audio_written, audio_taken;  /* frames into the ring, and out of it */
+static volatile int audio_pending;      /* chunks the system has and has not played */
+static int audio_started;
+
+static void audio_feed(void *arg)
+{
+	static AudioOutBuffer buffers[AUDIO_CHUNKS];
+	AudioOutBuffer *released;
+	u32 count;
+	int next = 0;
+
+	for (int i = 0; i < AUDIO_CHUNKS; i++)
+		buffers[i].buffer = aligned_alloc(0x1000, AUDIO_CHUNK * 4);
+	for (;;) {
+		u64 have;
+		s16 *out = buffers[next].buffer;
+
+		count = 0;
+		if (audio_pending && R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&released, &count)))
+			audio_pending -= count;
+		mutexLock(&audio_lock);
+		have = audio_written - audio_taken;
+		/* A whole chunk, or what there is when nothing else is left to
+		 * play (the end of a sound). */
+		if (!out || !(have >= AUDIO_CHUNK || (have && !audio_pending))) {
+			mutexUnlock(&audio_lock);
+			svcSleepThread(2000000ULL);
+			continue;
+		}
+		if (have > AUDIO_CHUNK)
+			have = AUDIO_CHUNK;
+		for (u64 i = 0; i < have; i++)
+			memcpy(out + i * 2, audio_ring + (audio_taken + i) % AUDIO_RING * 2, 4);
+		memset(out + have * 2, 0, (AUDIO_CHUNK - have) * 4);
+		audio_taken += have;
+		mutexUnlock(&audio_lock);
+
+		buffers[next].next = NULL;
+		buffers[next].buffer_size = AUDIO_CHUNK * 4;
+		buffers[next].data_size = AUDIO_CHUNK * 4;
+		buffers[next].data_offset = 0;
+		if (R_FAILED(audoutAppendAudioOutBuffer(&buffers[next]))) {
+			svcSleepThread(10000000ULL);
+			continue;
+		}
+		audio_pending++;
+		next = (next + 1) % AUDIO_CHUNKS;
+		while (audio_pending >= AUDIO_AHEAD) {
+			count = 0;
+			if (R_FAILED(audoutWaitPlayFinish(&released, &count, 100000000ULL)))
+				break;
+			audio_pending -= count;
+		}
+	}
+}
+
+static long gx_audio_open(long rate, long channels)
+{
+	static Thread thread;
+	Result rc = 0;
+
+	if (rate != 48000 || channels != 2) {
+		host_log("gx: audio: %ld Hz on %ld channels is not what the console plays\n", rate, channels);
+		return -1;
+	}
+	mutexLock(&audio_lock);
+	if (!audio_started) {
+		rc = audoutInitialize();
+		if (R_SUCCEEDED(rc))
+			rc = audoutStartAudioOut();
+		if (R_SUCCEEDED(rc))
+			rc = threadCreate(&thread, audio_feed, NULL, NULL, 0x8000, 0x2B, -2);
+		if (R_SUCCEEDED(rc)) {
+			svcSetThreadCoreMask(thread.handle, -3, 0x7);
+			know_thread(thread.handle, "audio");
+			rc = threadStart(&thread);
+		}
+		audio_started = R_SUCCEEDED(rc);
+	}
+	mutexUnlock(&audio_lock);
+	if (R_FAILED(rc))
+		host_log("gx: audio: no output (%#x)\n", rc);
+	else
+		host_log("gx: audio: playing\n");
+	return audio_started ? 0 : -1;
+}
+
+static long gx_audio_write(const s16 *frames, long count)
+{
+	u64 room;
+
+	mutexLock(&audio_lock);
+	room = AUDIO_RING - (audio_written - audio_taken);
+	if ((u64)count > room)
+		count = room;
+	for (long i = 0; i < count; i++)
+		memcpy(audio_ring + (audio_written + i) % AUDIO_RING * 2, frames + i * 2, 4);
+	audio_written += count;
+	mutexUnlock(&audio_lock);
+	return count;
+}
+
+static long gx_audio_queued(void)
+{
+	long queued;
+
+	mutexLock(&audio_lock);
+	queued = (long)(audio_written - audio_taken) + (long)audio_pending * AUDIO_CHUNK;
+	mutexUnlock(&audio_lock);
+	return queued;
+}
+
+/* What is not played yet is not to be: the ring is emptied, the chunks the
+ * system has are short enough to let them go. */
+static void gx_audio_drop(void)
+{
+	mutexLock(&audio_lock);
+	audio_taken = audio_written;
+	mutexUnlock(&audio_lock);
+}
+
+static void gx_audio_close(void)
+{
+	gx_audio_drop();
+}
+
 void *host_symbol(const char *name)
 {
 	static const struct {
@@ -1036,6 +1232,16 @@ void *host_symbol(const char *name)
 		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 	};
 
+	if (!strcmp(name, "gx_audio_open"))
+		return gx_audio_open;
+	if (!strcmp(name, "gx_audio_write"))
+		return gx_audio_write;
+	if (!strcmp(name, "gx_audio_queued"))
+		return gx_audio_queued;
+	if (!strcmp(name, "gx_audio_drop"))
+		return gx_audio_drop;
+	if (!strcmp(name, "gx_audio_close"))
+		return gx_audio_close;
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
@@ -1428,11 +1634,13 @@ void host_present(const uint8_t *pixels, int width, int height, int stride)
 }
 
 /*
- * The user: a finger on the screen is a finger on the page; the sticks and
- * the d-pad scroll; A brings up the keyboard to edit what has the focus, R is
- * the Enter key and L the Backspace key. With the headless Chromium (cdp.c), B
- * goes back, X reloads and Y asks for an address; the one with a window
- * (wl.c) has buttons of its own for those. (+ quits, in main().)
+ * The user: a finger on the screen is a finger on the page; the sticks
+ * scroll; R is the Enter key and L the Backspace key. With the Chromium that
+ * has a window (wl.c), the d-pad moves the focus about the page, A chooses
+ * what has it (text gets the keyboard) and Y brings up the keyboard on the
+ * address. With the headless one
+ * (cdp.c), the d-pad scrolls too, A asks for text to type, B goes back, X
+ * reloads and Y asks for an address. (+ quits, in main().)
  */
 static int ask_text(const char *guide, const char *initial, char *out, size_t room)
 {
@@ -1508,9 +1716,21 @@ int host_input(struct cdp_input *in)
 	} else if (down & HidNpadButton_L) {
 		in->type = CDP_BACKSPACE;
 	} else if (wayland && (down & HidNpadButton_A)) {
-		/* wl.c finds out what there is to edit, then asks for the text. */
+		/* What has the focus is chosen: a link is followed, a button
+		 * pressed, and text gets the keyboard. */
+		in->type = CDP_ACTIVATE;
+	} else if (wayland && (down & HidNpadButton_Y)) {
+		/* The keyboard, on the address of the window. */
 		in->type = CDP_KEYBOARD;
-	} else if (wayland && (down & (HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y))) {
+	} else if (wayland && (down & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left |
+				       HidNpadButton_Right))) {
+		/* The arrow keys, which move the focus from one thing of the
+		 * page to the next in that direction (Chromium is started with
+		 * --enable-spatial-navigation). */
+		in->type = CDP_KEY;
+		in->x = (down & HidNpadButton_Up) ? 103 : (down & HidNpadButton_Down) ? 108 :
+			(down & HidNpadButton_Left) ? 105 : 106;
+	} else if (wayland && (down & (HidNpadButton_B | HidNpadButton_X))) {
 		/* Nothing: the window has buttons of its own for those. */
 	} else if (down & HidNpadButton_Y) {
 		if (ask_text("Address", "https://", in->text, sizeof(in->text)))
@@ -1674,8 +1894,9 @@ static void read_commands(void)
 	}
 	if (f)
 		fclose(f);
+	/* No list: no menu either, see main(). */
 	if (!command_count)
-		strcpy(commands[command_count++], "/bin/hello");
+		strcpy(commands[0], DEFAULT_COMMAND);
 }
 
 /* Returns the command chosen with the d-pad and A, or -1 if + was pressed. */
@@ -1688,7 +1909,7 @@ static int menu(PadState *pad)
 
 		if (drawn != choice) {
 			consoleClear();
-			printf("gx - Linux programs on Horizon\n\n");
+			printf("Chromium NX\n\n");
 			for (int i = 0; i < command_count; i++) {
 				/* "[label] command" shows as its label. */
 				char *end = commands[i][0] == '[' ? strchr(commands[i], ']') : NULL;
@@ -1723,6 +1944,31 @@ static void kernel_print(const char *str, int len)
 	host_console_write(2, str, len);
 }
 
+/* Lets a thread run on any of the three cores, keeping the one it prefers.
+ * Horizon does not share a core between threads of one priority: whoever runs
+ * keeps it until it waits for something, and the others tied to that core
+ * wait for as long. A start that hung now and then, + doing nothing, was
+ * that: the main thread, the kernel's threads and ours were all tied to one
+ * core. */
+static void free_cores(Handle thread)
+{
+	svcSetThreadCoreMask(thread, -3, 0x7);
+}
+
+static lkl_thread_t (*kernel_thread_create)(void (*)(void *), void *);
+
+static lkl_thread_t create_kernel_thread(void (*fn)(void *), void *arg)
+{
+	lkl_thread_t t = kernel_thread_create(fn, arg);
+
+	/* What nx_host.c hands out is a Thread of libnx. */
+	if (t) {
+		free_cores(((Thread *)t)->handle);
+		know_thread(((Thread *)t)->handle, "kernel");
+	}
+	return t;
+}
+
 static void run(void *arg)
 {
 	static char *guest_env[] = {
@@ -1742,6 +1988,8 @@ static void run(void *arg)
 	 * console's memory is gone once a program has the screen: a kernel
 	 * warning in the middle of a web page then stopped everything. */
 	lkl_host_ops.print = kernel_print;
+	kernel_thread_create = lkl_host_ops.thread_create;
+	lkl_host_ops.thread_create = create_kernel_thread;
 	ret = lkl_init(&lkl_host_ops);
 	if (!ret)
 		net_id = net_add();
@@ -1813,10 +2061,11 @@ static void run(void *arg)
 		host_log("gx: cannot set up the guest address space\n");
 		host_exit(1);
 	}
+	/* The pipe first: it wants the descriptors Chromium knows it by. */
+	if (browser && cdp_start(wayland))
+		host_log("gx: cannot set up the pipe to Chromium\n");
 	if (wayland && wl_start())
 		host_log("gx: cannot open the Wayland display\n");
-	if (browser && cdp_start())
-		host_log("gx: cannot set up the pipe to Chromium\n");
 	host_log("gx: running %s\n\n", guest_argv[0]);
 	gx_exec(guest_argv[0], guest_argc, guest_argv, guest_env);
 	host_exit(1);
@@ -1859,16 +2108,107 @@ static void report_kernel_use(void)
 		 (unsigned long)heap, handles, (unsigned long)(pool_free >> 8));
 }
 
+/* Where one thread is: paused for the time it takes to read its registers. */
+static void report_where(Handle handle, const char *what)
+{
+	ThreadContext ctx;
+	const char *name = "";
+	u64 fp;
+	Result rc;
+
+	if (R_FAILED(svcSetThreadActivity(handle, ThreadActivity_Paused)))
+		return;
+	rc = svcGetThreadContext3(&ctx, handle);
+	svcSetThreadActivity(handle, ThreadActivity_Runnable);
+	if (R_FAILED(rc))
+		return;
+	for (int i = 0; i < GX_MAX_THREADS; i++)
+		if (gx_tp_tab[i].guest_tp != ~0UL && gx_tp_tab[i].thread &&
+		    gx_tp_tab[i].thread->host_id == handle)
+			name = gx_tp_tab[i].thread->name;
+	host_log(" thread %#x (%s%s%s)\n", handle, what, name[0] ? " " : "", name);
+	report_address("pc", ctx.pc.x);
+	report_address("lr", ctx.lr);
+	/* Who called whom, as far as the frames of the stack tell. */
+	fp = ctx.fp;
+	for (int depth = 0; depth < 10; depth++) {
+		MemoryInfo info;
+		u32 page_info;
+		u64 next, lr;
+
+		if (!fp || (fp & 15) || R_FAILED(svcQueryMemory(&info, &page_info, fp)) ||
+		    !(info.perm & Perm_R) || fp + 16 > info.addr + info.size)
+			break;
+		next = ((u64 *)fp)[0];
+		lr = ((u64 *)fp)[1];
+		if (!lr)
+			break;
+		report_address("  from", lr);
+		if (next <= fp)
+			break;
+		fp = next;
+	}
+}
+
+/* Everything has stopped: where every thread is, for gx.map to give names to
+ * the addresses in the host (they are counted from where gx is loaded). */
+static void report_stuck(void)
+{
+	Handle self = threadGetCurHandle();
+
+	host_log("gx: where the threads are (gx is loaded at %p):\n", _start);
+	for (int i = 0; i < known_count && i < MAX_KNOWN; i++)
+		if (known[i].handle && known[i].handle != self)
+			report_where(known[i].handle, known[i].what);
+	host_log("gx: that was all of them\n");
+	sync_log();
+}
+
+/* Asks the kernel how its memory is, when the watchdog says so: on a thread
+ * of its own, since a kernel that has stopped never answers and whoever asks
+ * waits with it. */
+static volatile int kernel_asked;
+
+static void kernel_probe(void *arg)
+{
+	for (;;) {
+		if (kernel_asked) {
+			gx_report_kernel_memory();
+			kernel_asked = 0;
+		}
+		svcSleepThread(100000000ULL);
+	}
+}
+
 /* Every so often, says in the log where the guest's threads are and what the
- * process costs: a guest that hangs leaves nothing else to go by. */
+ * process costs: a guest that hangs leaves nothing else to go by. Nothing
+ * here may wait on the kernel or, for long, on the lock of the log: those
+ * are what hangs. */
 static void watchdog(void *arg)
 {
 	unsigned swaps = 0;
+	int told = 0;
 
 	for (int seconds = 10;; seconds += 10) {
+		int locked = 0;
+
 		svcSleepThread(10000000000ULL);
 		if (finished)
 			break;
+		for (int i = 0; i < 300 && !(locked = mutexTryLock(&print_lock)); i++)
+			svcSleepThread(10000000ULL);
+		if (locked) {
+			mutexUnlock(&print_lock);
+		} else {
+			/* Its holder is not coming back: without it then. */
+			int stage = print_stage;
+
+			mutexInit(&print_lock);
+			console_on = 0;
+			host_log("\ngx: a thread kept the log to itself for 3 s, at stage %d\n", stage);
+			if (!told++)
+				report_stuck();
+		}
 		host_log("gx: after %d s\n", seconds);
 		bury_threads();
 		gmem_report();
@@ -1877,8 +2217,14 @@ static void watchdog(void *arg)
 			swaps = gl_swaps;
 		}
 		report_kernel_use();
-		gx_report_kernel_memory();
 		gx_report_threads();
+		if (kernel_asked) {
+			host_log("gx: the kernel has not answered for 10 s\n");
+			if (!told++)
+				report_stuck();
+		} else {
+			kernel_asked = 1;
+		}
 		sync_log();
 	}
 }
@@ -1896,24 +2242,55 @@ static void display(void *arg)
 	}
 }
 
+/* Chromium reserves more addresses than a program started the usual way has:
+ * the Homebrew Loader gives its programs 36 bits of them (64 GB), and a
+ * program installed as a title of its own can be given 39 (512 GB). Says so
+ * and waits for + if this is the small kind; returns whether it is large. */
+static int enough_addresses(PadState *pad)
+{
+	u64 size = 0;
+
+	svcGetInfo(&size, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0);
+	if (size >= (256ULL << 30))
+		return 1;
+	printf("Chromium NX\n\n"
+	       "Chromium needs a 39-bit address space, and this one is smaller\n"
+	       "(%lu GB of addresses, 512 GB are needed).\n\n"
+	       "Install Chromium NX as a forwarder with Sphaira, choosing a\n"
+	       "39-bit address space for it, then start it from the HOME menu.\n\n"
+	       "+: quit\n", (unsigned long)(size >> 30));
+	while (appletMainLoop()) {
+		consoleUpdate(NULL);
+		padUpdate(pad);
+		if (padGetButtonsDown(pad) & HidNpadButton_Plus)
+			break;
+		svcSleepThread(16666666ULL);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	static Thread display_thread, watchdog_thread;
+	static Thread display_thread, watchdog_thread, probe_thread;
 	PadState pad;
 	int choice;
 
 	consoleInit(NULL);
 	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
 	padInitializeDefault(&pad);
+	if (!enough_addresses(&pad)) {
+		consoleExit(NULL);
+		svcExitProcess();   /* see __libnx_initheap() */
+	}
 	mkdir(GX_DIR, 0777);
 	read_commands();
-	choice = menu(&pad);
+	choice = command_count ? menu(&pad) : 0;
 	if (choice < 0) {
 		consoleExit(NULL);
 		svcExitProcess();   /* see __libnx_initheap() */
 	}
 	consoleClear();
-	log_file = fopen(GX_DIR "/gx.log", "w");
+	log_file = fopen(GX_DIR "/chromium-nx.log", "w");
 
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
@@ -1941,10 +2318,22 @@ int main(int argc, char **argv)
 
 	/* Everything runs on created threads: on the main thread of a homebrew,
 	 * threadGetSelf() is not what LKL needs it to be (see nro/source/main.c). */
-	if (R_SUCCEEDED(threadCreate(&display_thread, display, NULL, NULL, 0x8000, 0x2C, -2)))
+	free_cores(CUR_THREAD_HANDLE);
+	know_thread(envGetMainThreadHandle(), "main");
+	if (R_SUCCEEDED(threadCreate(&display_thread, display, NULL, NULL, 0x8000, 0x2C, -2))) {
+		free_cores(display_thread.handle);
+		know_thread(display_thread.handle, "display");
 		threadStart(&display_thread);
-	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, 0x2C, -2)))
+	}
+	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, 0x2C, -2))) {
+		free_cores(watchdog_thread.handle);
 		threadStart(&watchdog_thread);
+	}
+	if (R_SUCCEEDED(threadCreate(&probe_thread, kernel_probe, NULL, NULL, 0x10000, 0x2C, -2))) {
+		free_cores(probe_thread.handle);
+		know_thread(probe_thread.handle, "probe");
+		threadStart(&probe_thread);
+	}
 	if (start_thread(run, NULL, MAIN_STACK))
 		printf("gx: cannot start\n");
 
@@ -1956,7 +2345,8 @@ int main(int argc, char **argv)
 	}
 	/* Kernel and guest threads cannot be stopped one by one; ending the
 	 * process is the only clean way out (back to the HOME menu). */
-	mutexLock(&print_lock);
+	for (int i = 0; i < 100 && !mutexTryLock(&print_lock); i++)
+		svcSleepThread(10000000ULL);   /* not for ever: its holder may be stuck */
 	if (log_file)
 		fclose(log_file);
 	svcExitProcess();

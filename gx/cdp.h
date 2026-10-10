@@ -21,6 +21,8 @@ enum {
 	CDP_KEYBOARD,     /* the user wants the on-screen keyboard, to edit what has the focus */
 	CDP_ENTER,
 	CDP_BACKSPACE,
+	CDP_KEY,          /* x: a key pressed and let go, by the number Linux gives it */
+	CDP_ACTIVATE,     /* what has the focus is chosen: edited if it is text, pressed otherwise */
 	CDP_QUIT,
 };
 
@@ -32,8 +34,24 @@ struct cdp_input {
 
 /* Makes the pipe Chromium is told about with --remote-debugging-pipe (its
  * descriptors 3 and 4) and starts the thread at the other end. To be called
- * once the kernel runs and before the guest does. */
-int cdp_start(void);
+ * once the kernel runs and before the guest does, and before anything else
+ * opens descriptors for it.
+ *
+ * With window, Chromium has a window of its own (wl.c shows it and gives it
+ * what the user does) and the pipe is only there for what a window does not
+ * say: whether what has the focus is text to edit. */
+int cdp_start(int window);
+
+/* For wl.c. cdp_activate() asks what CDP_ACTIVATE is to do, and returns 0 if
+ * there is no one to ask. cdp_wanted() is the answer when it has come, once:
+ * CDP_KEYBOARD (also when the user touched some text: no one asked then) or
+ * CDP_ENTER, and CDP_NONE the rest of the time. */
+int cdp_activate(void);
+int cdp_wanted(void);
+/* Has the page go back (CDP_BACK), load again (CDP_RELOAD), or take the
+ * keyboard back from the address above it (CDP_NAVIGATE); returns 0 if there
+ * is no one to tell. */
+int cdp_page(int what);
 
 /* Pictures shown during the last whole second, for a host that wants to
  * display it. */

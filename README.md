@@ -1,118 +1,155 @@
-# lkl-switch
+# Chromium NX
 
-**Linux running as a homebrew app inside Horizon OS — and running real,
-unmodified Linux binaries (busybox) — on a hacked Nintendo Switch.**
+**A Chromium web browser running as a homebrew app inside Horizon OS, on a
+hacked Nintendo Switch.**
 
-Not L4T. Not a reboot. This is the Linux kernel (6.12) linked *into* an NRO
-homebrew, booting and running alongside Horizon OS, plus a from-scratch ELF
-loader + syscall bridge that runs an actual aarch64 Linux binary on top of it —
-including a real, off-the-shelf static-glibc **busybox**.
+Chromium NX is an ordinary NRO started from
+the Homebrew Menu. Inside it, the Linux kernel runs as a library (LKL), and on
+top of that kernel runs the stock arm64 Chromium binary from Debian,
+unmodified, drawing with the console's GPU.
 
-As far as I can tell, nobody has published Linux *executing real binaries* from
-inside Horizon before. L4T replaces the system at boot; this runs as an app.
+This is experimental software.
 
-```
-=== Fase 8: busybox real ===
-Rodando: busybox ls /
+## What it does
 
-data  dev  init  root  tmp
-```
+- Runs Debian's `chromium-shell` 154 (the Chromium engine with a minimal
+  window), as shipped, without recompiling it.
+- Renders with the GPU: ANGLE inside Chromium talks to the console's own
+  EGL/GLES driver
+- Runs JavaScript
+- Touch screen, on-screen keyboard, and the pad:
 
-*(real `busybox ls /` on the Switch, listing the LKL root filesystem)*
+  | Input | Action |
+  |---|---|
+  | Touch | Tap, drag, scroll; touching a text field opens the keyboard |
+  | D-pad | Moves the focus from link to link |
+  | A | Follows the focused link, or opens the keyboard on a text field |
+  | B / X | Back / reload |
+  | Y | Opens the keyboard on the address bar |
+  | L / R | Backspace / Enter |
+  | Sticks | Scroll |
+  | + | Quit |
 
-> ⚠️ **What this is not:** no GUI, no browser, no GPU, no desktop. The kernel
-> has no MMU (`CONFIG_MMU` off) and cannot run graphical software. If you want a
-> Linux desktop on your Switch, use [L4T Ubuntu](https://wiki.switchroot.org/).
-> This project is a different thing: the Linux kernel as a library inside a
-> homebrew, running real binaries — a technical first, and a foundation to build on.
+- HTTPS networking through the console's Wi-Fi.
+- Sound, through the console's audio output.
 
-## What works (tested on hardware)
+## Status
 
-- **Boots Linux 6.12** inside an NRO — full dmesg, on-screen.
-- **Runs syscalls** against the live kernel: `uname`, mount `tmpfs`, create/read files.
-- **Runs real, unmodified busybox**: a stock static-glibc aarch64 busybox is
-  loaded, relocated, its `svc` instructions patched, and executed on top of the
-  live LKL kernel. `busybox ls /`, `uname -a`, `echo`, `ls -la` all work —
-  full glibc process startup (TLS, pointer guard, exit handlers, IFUNC relocs)
-  running under a from-scratch syscall bridge, no CPU emulation.
+Confirmed on a real console:
 
-The executor runs the guest **natively** (it's aarch64, same as the Switch): no
-CPU emulation, no exception handler. It rewrites each `svc #0` into a branch to a
-trampoline that fully preserves guest state (x0–x18/x30, NZCV/FP, `q0–q31`, and
-the guest's `TPIDR_EL0`), swaps to a host stack + thread pointer, and forwards
-the Linux syscall ABI into `lkl_syscall()`. The ELF image is mapped with proper
-per-segment page permissions via `svcMapProcessCodeMemory` (RX `.text`, RW
-`.data`/`.bss`) at one load bias — the correct Horizon W^X pattern (RWX is
-forbidden by the kernel). See [DEVLOG.md](DEVLOG.md) for the long bug hunt this
-took (process stack + auxv, TLS, pointer-guard, SIMD preservation, the `x0=0`
-process-entry bug, and W^X on hardware).
+- Google, Wikipedia and YouTube load and are usable; YouTube videos play.
+- GPU rendering and the JIT.
+- Touch, scrolling, text entry with the system keyboard, d-pad focus.
+
+Known problems and limits:
+
+- **Nothing is kept between sessions**: no cookies, no cache, no history.
+- **The interface is `chromium-shell`'s**: four text buttons and an address
+  bar. No tabs, bookmarks, settings page or extensions.
+
+## Install
+
+1. Build (below), or get the three files from someone who did.
+2. Back up `atmosphere/hbl.nsp` on the SD card, then replace it with
+   `gx/dist-hbl/atmosphere/hbl.nsp`.
+3. Copy the folder `gx/dist-nx/switch/chromium-nx/` to `/switch/` on the SD
+   card. It holds `chromium-nx.nro` and `chromium.ext4` (Chromium and the
+   Linux files around it).
+4. Start **Chromium NX** from the Homebrew Menu. It opens google.com.
+
+The log of the last run is `/switch/chromium-nx/chromium-nx.log`.
 
 ## How it works
 
 ```
-┌─ NRO (homebrew) ─────────────────────────────────────────┐
-│  main.c        boots LKL on a dedicated thread            │
-│  nx_host.c     lkl_host_operations via libnx              │
-│                (threads, semaphores, timers, console)     │
-│  ┌─ LKL (Linux 6.12, ARCH=lkl, no-MMU) ────────────────┐  │
-│  │  full kernel: VFS, tmpfs, ext4, TCP/IP stack        │  │
-│  └─────────────────────────────────────────────────────┘  │
-│  nx_exec.c     ELF loader → svcMapProcessCodeMemory       │
-│                (RX .text / RW .data) → patch svc → run     │
-│  nx_trampoline.s  guest svc → lkl_syscall → back to guest │
-└───────────────────────────────────────────────────────────┘
+┌─ chromium-nx.nro ──────────────────────────────────────────────┐
+│  host_nx.c   the Horizon side: memory, threads, screen, pad,    │
+│              sound, the SD card as a disk, the network          │
+│  ┌─ LKL: Linux as a library (no MMU) ────────────────────────┐  │
+│  │  files (ext4 image, tmpfs), sockets, pipes, epoll, ...    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│  gx: runs Linux programs on that kernel                         │
+│    gelf.c   loads dynamically linked ELF programs               │
+│    gmem.c   the guest's address space (mmap, mprotect, ...)     │
+│    gsys.c   system calls: most go to LKL, memory and threads    │
+│             are done here                                       │
+│    tramp.S  every `svc` of the guest is patched into a jump     │
+│             here                                                │
+│    wl.c     a Wayland compositor: Chromium's window and inputs  │
+│    cdp.c    Chromium's debugging pipe, for what a window does   │
+│             not say (is the focus on a text field?)             │
+│    nat.c    a user-mode NAT between LKL's network and Horizon's │
+│             sockets                                             │
+│  ┌─ guest ───────────────────────────────────────────────────┐  │
+│  │  chromium-shell (Debian arm64), glibc and its libraries   │  │
+│  │  libEGL / libGLESv2 / libasound: small replacements that  │  │
+│  │  call the host's drivers                                  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+The guest runs natively: it is arm64 code on an arm64 processor, with no
+emulation. What the kernel of a real Linux would do for it is split between
+LKL (files, network) and gx (memory, threads, time).
+
+A few things Horizon does differently had to be worked around:
+
+- **No memory that is writable and executable.** A page of V8's code area is
+  one or the other; the fault of a write to an executable page, or of a jump
+  to a writable one, flips it.
+- **Shared memory is scarce** (80 objects for the whole console) and must be
+  mapped whole, so shared files are pooled into a few large pieces.
+- **The kernel keeps a record per run of pages mapped alike**, and stops
+  serving a process past about ten thousand of them, so guest memory is
+  committed in large units.
+- **Reading the virtual counter traps**; it is emulated in the exception
+  handler.
 
 ## Build
 
-Everything builds in a Docker container (devkitPro toolchain + libnx):
+Everything builds in two Docker containers that share a volume: `lkl-gx`
+(Debian 12 with arm64 packages, for the PC test bench and Chromium's root
+image) and `lkl-gx-nx` (devkitPro's devkitA64, for the console). Each script
+says at its top how its container is made. `gx/docker/Dockerfile` describes the
+first one but has not been rebuilt from scratch recently.
 
 ```bash
-docker run -d --name lkl-switch-build -v "$PWD:/project" devkitpro/devkita64:latest sleep infinity
-docker exec lkl-switch-build bash -c "apt-get update && apt-get install -y flex bison bc libelf-dev cpio rsync"
-docker exec lkl-switch-build bash -c "git clone --depth 1 https://github.com/lkl/linux.git /work/linux"
-
-docker exec lkl-switch-build bash /project/scripts/build-lkl.sh    # cross-compile the kernel
-docker exec lkl-switch-build bash /project/scripts/build-nro.sh    # link the NRO + build the guest ELF
+docker exec lkl-gx    bash /project/gx/build-lkl.sh        # LKL for the PC bench
+docker exec lkl-gx    bash /project/gx/build-pc.sh         # gx for PC, guest libraries, tests
+docker exec lkl-gx    bash /project/gx/build-chromium.sh   # Chromium's root images
+docker exec lkl-gx-nx bash /project/gx/build-nx.sh         # the NRO -> gx/dist-nx
+docker exec lkl-gx-nx bash /project/gx/build-hbl.sh        # the loader -> gx/dist-hbl
 ```
 
-Build a static-PIE aarch64 busybox to run as the guest:
+`DEV=1 build-nx.sh` adds a `programs.txt` next to the NRO: the app then shows
+a menu of what to run (test programs, Chromium without the GPU or the JIT)
+instead of starting the browser.
 
-```bash
-docker exec lkl-switch-build bash /project/scripts/build-busybox-pie.sh   # -> busybox
-```
+## Testing on a PC
 
-Output: `nro/nro.nro` and the `busybox` binary.
+The same code builds for an arm64 Linux host and runs under `qemu-aarch64`,
+with the same restrictions the console imposes (no writable and executable
+memory, pooled shared memory). `build-pc.sh` runs the small tests;
+`build-chromium.sh wayland [url]` runs Chromium with a scripted user and
+writes the pictures it draws to files. Most of the work was done this way
+before touching hardware.
 
-## Install & run
+## Layout
 
-1. Copy `nro/nro.nro` → `sd:/switch/lkl-switch.nro`
-2. Copy the built `busybox` → `sd:/busybox`
-3. Open the **Homebrew Menu** (hold **R** while launching a game, for full memory)
-4. Launch **lkl-switch** — it boots Linux and runs `busybox ls /`
+- `gx/` — everything described above.
+- `nro/`, `scripts/`, `pc-test/`, `DEVLOG.md` — the original lkl-switch
+  project this one grew from: its NRO that boots LKL and runs busybox. gx
+  reuses its `nro/source/nx_host.c` (LKL's host operations on libnx).
 
-## Testing on PC (no Switch needed)
+## Credits
 
-The kernel + all logic is portable C. `scripts/pc-*.sh` build the same code
-against the POSIX LKL host and run it under qemu-aarch64 in seconds — the whole
-binary-executor chain was developed and debugged this way before touching
-hardware.
+- **mnnobre** ([mnnobre/lkl-switch](https://github.com/mnnobre/lkl-switch))
+  — the original project: Linux as a library inside an NRO, and the first
+  executor of Linux binaries on it.
+- [LKL](https://github.com/lkl/linux), [libnx](https://github.com/switchbrew/libnx)
+  and devkitPro, [nx-hbloader](https://github.com/switchbrew/nx-hbloader),
+  Mesa, and of course [Chromium](https://www.chromium.org/).
 
-## Roadmap
-
-- [x] Boot Linux in an NRO
-- [x] Syscalls against the live kernel
-- [x] ELF binary executor
-- [x] **Run real, unmodified busybox on hardware** (`ls`, `uname`, `echo`, ...)
-- [ ] More applets + an **interactive shell**. A single applet per launch works
-  today; an interactive `sh` needs a keyboard (Switch `swkbd`) wired to stdin and
-  a fork story (LKL has no processes — busybox *standalone* mode helps).
-  **Contributions very welcome.**
-- [ ] Persistent ext4 disk image on the SD (validated on PC; SD block backend WIP)
-- [ ] Networking (Horizon `bsd:u` → virtio_net; the TCP stack already inits)
-
-## Credits & license
-
-Built on [LKL](https://github.com/lkl/linux) and
-[libnx](https://github.com/switchbrew/libnx)/devkitPro. My code (nx_host,
-nx_exec, trampoline, loaders) is MIT; LKL/kernel code keeps its GPL-2.0.
+The Linux kernel (LKL) is GPL-2.0. The original lkl-switch code is MIT
+according to its author. Chromium and its logo are the Chromium Authors'.
+Chromium NX is not affiliated with Google or Nintendo.

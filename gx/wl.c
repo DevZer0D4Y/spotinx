@@ -643,6 +643,14 @@ static void type_text(const char *text, uint32_t ms)
 	}
 }
 
+/* Where the window of chromium-shell has its address, right of its buttons. */
+#define ADDRESS_LEFT 296
+#define ADDRESS_BOTTOM 42
+#define ADDRESS_FOCUS_NS 200000000ULL
+
+static uint64_t address_touched;
+static int edit_is_address;
+
 static void input(const struct cdp_input *in, uint32_t ms)
 {
 	if (!main_surface)
@@ -665,6 +673,16 @@ static void input(const struct cdp_input *in, uint32_t ms)
 			event(touch_id, 1, "uui", serial++, ms, 0);
 			event(touch_id, 3, "");
 		}
+		/* A finger on the address: the keyboard, once the window has
+		 * made the address what keys go to. The page says when its own
+		 * text is touched (cdp.c); the window's has no one to say it,
+		 * but is always in the same place. */
+		if (in->y < ADDRESS_BOTTOM && in->x >= ADDRESS_LEFT)
+			address_touched = host_now_ns();
+		break;
+	case CDP_BACK:
+	case CDP_RELOAD:
+		cdp_page(in->type);
 		break;
 	case CDP_SCROLL:
 		if (pointer_id) {
@@ -681,8 +699,27 @@ static void input(const struct cdp_input *in, uint32_t ms)
 	case CDP_TEXT:
 		type_text(in->text, ms);
 		break;
+	case CDP_KEY:
+		press_key(in->x, 0, ms);
+		break;
+	case CDP_ACTIVATE:
+		/* Text is edited, anything else gets the Enter key; the page
+		 * knows which (cdp.c), and so does the main loop a moment
+		 * later. Enter if there is no asking. */
+		if (!cdp_activate())
+			press_key(28, 0, ms);
+		break;
 	case CDP_KEYBOARD:
-		edit_start();
+		/* The user asks for the keyboard: to go somewhere, so on the
+		 * address, reached the way a finger reaches it. */
+		if (touch_id) {
+			event(touch_id, 0, "uuuiff", serial++, ms, main_surface, 0,
+			      (ADDRESS_LEFT + WL_SCREEN_WIDTH) / 2, ADDRESS_BOTTOM / 2);
+			event(touch_id, 3, "");
+			event(touch_id, 1, "uui", serial++, ms, 0);
+			event(touch_id, 3, "");
+			address_touched = host_now_ns();
+		}
 		break;
 	case CDP_ENTER:
 		press_key(28, 0, ms);
@@ -739,8 +776,16 @@ static void edit_finish(void)
 	edit_state = EDIT_IDLE;
 	edited.text[edited_len] = 0;
 	flush();
-	if (host_ask_text(edited.text, sizeof(edited.text)))
+	if (host_ask_text(edited.text, sizeof(edited.text))) {
 		type_text(edited.text, (uint32_t)(host_now_ns() / 1000000));
+		/* An address is typed to go there. */
+		if (edit_is_address) {
+			press_key(28, 0, (uint32_t)(host_now_ns() / 1000000));
+			flush();
+			cdp_page(CDP_NAVIGATE);   /* and the keys are the page's again */
+		}
+	}
+	edit_is_address = 0;
 }
 
 static void edit_step(uint64_t now)
@@ -862,6 +907,19 @@ static void wl_thread(void *arg)
 		now = host_now_ns();
 		while (host_input(&in))
 			input(&in, (uint32_t)(now / 1000000));
+		if (address_touched && now - address_touched > ADDRESS_FOCUS_NS) {
+			address_touched = 0;
+			edit_is_address = 1;
+			edit_start();
+		}
+		switch (cdp_wanted()) {
+		case CDP_KEYBOARD:
+			edit_start();
+			break;
+		case CDP_ENTER:
+			press_key(28, 0, (uint32_t)(now / 1000000));
+			break;
+		}
 		edit_step(now);
 		frame_tick(now);
 		flush();

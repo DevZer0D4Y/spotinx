@@ -1,6 +1,6 @@
 #!/bin/bash
-# Builds gx for the Nintendo Switch (an NRO for the Homebrew Menu) and lays out
-# what goes on the SD card in gx/dist-nx.
+# Builds gx for the Nintendo Switch (an NRO for the Homebrew Menu, "Chromium NX")
+# and lays out what goes on the SD card in gx/dist-nx.
 #
 #   docker exec lkl-gx-nx bash /project/gx/build-nx.sh
 #
@@ -101,18 +101,24 @@ done
 ${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map" \
 	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
 	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lpng -lturbojpeg -lz -lnx -lm -o "$OUT/gx.elf"
-nacptool --create "gx" "lkl-switch" "0.1" "$OUT/gx.nacp"
-elf2nro "$OUT/gx.elf" "$OUT/gx.nro" --nacp="$OUT/gx.nacp" --icon=$DEVKITPRO/libnx/default_icon.jpg
+nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
+elf2nro "$OUT/gx.elf" "$OUT/gx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
 
 echo "== SD card"
+# Everything is in one folder of the card, sdmc:/switch/chromium-nx: the
+# program, Chromium's root image, and the log it writes. Started as it is, it
+# runs Chromium; with DEV=1 the folder also gets programs.txt, a menu of what
+# to run, and the test programs build-pc.sh made.
+APP=$DIST/switch/chromium-nx
 rm -rf "$DIST"
-mkdir -p "$DIST/switch/gx" "$DIST/gx"
-cp "$OUT/gx.nro" "$DIST/switch/gx/gx.nro"
-[ -e "$PC_SYSROOT/bin/hello" ] ||
-	{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
-cp -r "$PC_SYSROOT" "$DIST/gx/sysroot"
-cat >"$DIST/gx/programs.txt" <<'EOF'
-# One command per line; gx offers them as a menu. -t traces the syscalls.
+mkdir -p "$APP"
+cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
+if [ -n "${DEV:-}" ]; then
+	[ -e "$PC_SYSROOT/bin/hello" ] ||
+		{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
+	cp -r "$PC_SYSROOT" "$APP/sysroot"
+	cat >"$APP/programs.txt" <<'EOF'
+# One command per line, offered as a menu. -t traces the syscalls.
 /bin/hello
 /bin/threads
 /bin/dl
@@ -122,21 +128,18 @@ cat >"$DIST/gx/programs.txt" <<'EOF'
 /bin/curl -sS -m 60 https://example.com/
 -t /bin/hello
 EOF
-# Chromium, if build-chromium.sh made its root: the picture of the page it
-# draws ends up in sdmc:/gx/shot.png.
-if [ -e "$PC_OUT/chromium.ext4" ]; then
-	cp "$PC_OUT/chromium.ext4" "$DIST/gx/chromium.ext4"
-	C="@chromium.ext4 >/tmp/shot.png /usr/lib/chromium/chromium-headless-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless"
-	{
-		B="-b @chromium.ext4 /usr/lib/chromium/chromium-headless-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --remote-debugging-pipe --window-size=1280,720 --hide-scrollbars"
+fi
+# Chromium, if build-chromium.sh made its root: the one with a window, in the
+# image made for the console (without what only the PC's tests use).
+if [ -e "$PC_OUT/chromium-switch.ext4" ]; then
+	cp "$PC_OUT/chromium-switch.ext4" "$APP/chromium.ext4"
+	[ -z "${DEV:-}" ] || {
 		# A page that changes at every frame and says how many frames a
-		# second the page itself gets (requestAnimationFrame): what gx
-		# shows in the corner is how many of them reach the screen.
+		# second the page itself gets (requestAnimationFrame).
 		A='data:text/html,<body%20style="margin:0;background:%23204080;color:white;font:80px%20sans-serif"><div%20id=d%20style="position:absolute;top:300px;width:300px;height:300px;background:linear-gradient(red,lime)"></div><p%20id=o%20style="margin:100px%20200px">...</p><script>t=0;n=0;l=0;function%20f(now){t+=6;n++;if(now-l>=1000){o.textContent=n+"%20frames/s%20in%20the%20page";n=0;l=now}d.style.left=(t%251000)+"px";requestAnimationFrame(f)}requestAnimationFrame(f)</script>'
-		# The Chromium with a window, on gx's Wayland display: the real
-		# thing. The entries after it are the older way, pictures over the
-		# debugging pipe of the headless one.
-		W="-w @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --ozone-platform=wayland"
+		# On gx's Wayland display (wl.c), with the debugging pipe for
+		# what a window does not say (cdp.c).
+		W="-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --ozone-platform=wayland --enable-spatial-navigation --remote-debugging-pipe"
 		# The same drawing with the GPU: ANGLE inside Chromium, on the
 		# console's own EGL and GLES through gx's libEGL and libGLESv2.
 		G="${W/--disable-gpu/--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu}"
@@ -155,10 +158,7 @@ if [ -e "$PC_OUT/chromium.ext4" ]; then
 		echo "[Chromium WINDOW: wikipedia.org] $W https://www.wikipedia.org/"
 		echo "[Chromium WINDOW: speed test] $W $A"
 		echo "[Chromium WINDOW: the test page] $W file:///usr/share/gx/page.html"
-		echo "[Chromium (old way): wikipedia.org] $B https://www.wikipedia.org/"
-		echo "[Chromium (old way): speed test] $B $A"
-		echo "[Chromium: text only (DOM of the test page)] $C --dump-dom file:///usr/share/gx/page.html"
-	} >>"$DIST/gx/programs.txt"
+	} >>"$APP/programs.txt"
 fi
-ls -la "$DIST/switch/gx/gx.nro"
+ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

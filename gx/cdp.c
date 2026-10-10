@@ -25,6 +25,26 @@
 #define HOST_WRITE_FD 251
 
 static int next_id = 1;
+static int window;          /* Chromium shows itself: see cdp_start() */
+static int ask, wanted, page_action;   /* between wl.c's thread and ours */
+
+/*
+ * What every page is given when Chromium has a window: a way to tell whether
+ * what has the focus is text to edit, and a word to us (gxEdit, a binding)
+ * when the user touches such text, which is when the keyboard should come up
+ * without being asked for.
+ */
+static const char page_script[] =
+	"(function(){if(window.__gx)return;window.__gx=1;"
+	"function ed(e){if(!e)return false;if(e.isContentEditable)return true;"
+	"if(e.readOnly||e.disabled)return false;if(e.tagName=='TEXTAREA')return true;"
+	"if(e.tagName!='INPUT')return false;"
+	"return['text','search','url','email','password','tel','number'].indexOf(e.type)>=0}"
+	"window.__gxText=function(){var a=document.activeElement;"
+	"while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return ed(a)};"
+	"document.addEventListener('click',function(v){"
+	"if(v.isTrusted&&v.pointerType=='touch'&&window.__gxText()&&window.gxEdit)gxEdit('touch')},true)"
+	"})()";
 static char session[128];   /* the page we are attached to, once we are */
 
 /*
@@ -107,7 +127,7 @@ static void send_text(const char *text, size_t len)
 /* Sends a command to the page (or to the browser before there is a page). */
 static void command(const char *method, const char *params_fmt, ...)
 {
-	char params[1024] = "{}", text[1400];
+	char params[3072] = "{}", text[3400];
 	va_list ap;
 	int n;
 
@@ -214,7 +234,19 @@ static void handle_message(char *message, size_t len)
 		char target[128];
 		const char *page = strstr(message, "\"type\":\"page\"");
 
-		if (string_value(message, "sessionId", session, sizeof(session)) > 0) {
+		if (string_value(message, "sessionId", session, sizeof(session)) > 0 && window) {
+			char script[2048];
+
+			json_escape(script, sizeof(script), page_script);
+			command("Runtime.enable", NULL);
+			command("Runtime.addBinding", "{\"name\":\"gxEdit\"}");
+			command("Page.enable", NULL);
+			command("Page.addScriptToEvaluateOnNewDocument", "{\"source\":\"%s\"}", script);
+			command("Runtime.evaluate", "{\"expression\":\"%s\"}", script);
+			/* The page has the keyboard from the start, not the
+			 * address above it. */
+			command("Page.bringToFront", NULL);
+		} else if (session[0]) {
 			command("Page.enable", NULL);
 			command("Page.startScreencast",
 				"{\"format\":\"jpeg\",\"quality\":70,\"maxWidth\":1280,\"maxHeight\":720}");
@@ -228,6 +260,16 @@ static void handle_message(char *message, size_t len)
 				command("Target.attachToTarget", "{\"targetId\":\"%s\",\"flatten\":true}",
 					target);
 		}
+		return;
+	}
+	if (window) {
+		if (strstr(message, "\"method\":\"Runtime.bindingCalled\"") &&
+		    strstr(message, "\"name\":\"gxEdit\""))
+			__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
+		else if (strstr(message, "\"value\":\"gx-text\""))
+			__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
+		else if (strstr(message, "\"value\":\"gx-other\""))
+			__atomic_store_n(&wanted, CDP_ENTER, __ATOMIC_SEQ_CST);
 		return;
 	}
 	if (!strstr(message, "\"method\":\"Page.screencastFrame\""))
@@ -357,6 +399,24 @@ static void cdp_thread(void *arg)
 				command("Target.getTargets", NULL);
 			continue;
 		}
+		if (window) {
+			/* wl.c has the user; we have its questions. */
+			switch (__atomic_exchange_n(&page_action, CDP_NONE, __ATOMIC_SEQ_CST)) {
+			case CDP_BACK:
+				command("Runtime.evaluate", "{\"expression\":\"history.back()\"}");
+				break;
+			case CDP_RELOAD:
+				command("Page.reload", NULL);
+				break;
+			case CDP_NAVIGATE:
+				command("Page.bringToFront", NULL);
+				break;
+			}
+			if (__atomic_exchange_n(&ask, 0, __ATOMIC_SEQ_CST))
+				command("Runtime.evaluate", "{\"expression\":\"window.__gxText&&"
+					"__gxText()?'gx-text':'gx-other'\",\"returnByValue\":true}");
+			continue;
+		}
 		while (host_input(&in)) {
 			handle_input(&in);
 			stats.inputs++;
@@ -366,11 +426,33 @@ static void cdp_thread(void *arg)
 	free(message);
 }
 
-int cdp_start(void)
+int cdp_activate(void)
+{
+	if (!window || !session[0])
+		return 0;
+	__atomic_store_n(&ask, 1, __ATOMIC_SEQ_CST);
+	return 1;
+}
+
+int cdp_page(int what)
+{
+	if (!window || !session[0])
+		return 0;
+	__atomic_store_n(&page_action, what, __ATOMIC_SEQ_CST);
+	return 1;
+}
+
+int cdp_wanted(void)
+{
+	return __atomic_exchange_n(&wanted, CDP_NONE, __ATOMIC_SEQ_CST);
+}
+
+int cdp_start(int with_window)
 {
 	int to_guest[2], from_guest[2];
 	long args[6] = { 0 };
 
+	window = with_window;
 	if (lkl_sys_pipe(to_guest) || lkl_sys_pipe(from_guest))
 		return -1;
 	/* Chromium reads commands on 3 and writes on 4; our ends go far away
