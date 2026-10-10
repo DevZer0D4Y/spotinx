@@ -409,9 +409,32 @@ void *host_reserve(size_t *len)
 
 static size_t page_of(void *addr) { return ((uint8_t *)addr - arena) / GX_PAGE; }
 
-/* Finds free pool pages, n at most and in one piece: the first run found. */
+/* Finds free pool pages, n at most and in one piece. Large pieces come from
+ * the top of the pool, at places that are multiples of their usual size, and
+ * small ones from the bottom: memory that is given back in pieces of every
+ * size otherwise leaves the pool, and with it the heap it is made of, cut
+ * into thousands of runs the kernel keeps a record of each. */
+#define POOL_LARGE 64   /* pages: the unit data is committed by (gmem.c) */
+
 static size_t pool_take(size_t n, size_t *first)
 {
+	if (n >= POOL_LARGE) {
+		for (size_t p = pool_pages & ~(size_t)(POOL_LARGE - 1); p >= POOL_LARGE;) {
+			size_t run = 0;
+
+			p -= POOL_LARGE;
+			if (pool_used[p] || pool_used[p + POOL_LARGE - 1])
+				continue;
+			while (run < n && p + run < pool_pages && !pool_used[p + run])
+				run++;
+			if (run < POOL_LARGE)
+				continue;
+			memset(&pool_used[p], 1, run);
+			pool_free -= run;
+			*first = p;
+			return run;
+		}
+	}
 	for (int pass = 0; pass < 2; pass++) {
 		for (size_t p = pass ? 0 : pool_hint; p < pool_pages; p++) {
 			size_t run = 0;
@@ -779,6 +802,15 @@ static void know_thread(Handle handle, const char *what)
 	}
 }
 
+static int count_threads(void)
+{
+	int count = 0;
+
+	for (int i = 0; i < known_count && i < MAX_KNOWN; i++)
+		count += known[i].handle != 0;
+	return count;
+}
+
 static void forget_thread(Handle handle)
 {
 	for (int i = 0; i < known_count && i < MAX_KNOWN; i++)
@@ -817,7 +849,7 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 			threadClose(&s->thread);
 	}
 	if (R_FAILED(rc)) {
-		host_log("gx: cannot start a thread (%#x)\n", rc);
+		host_log("gx: cannot start a thread (%#x), with %d of them\n", rc, count_threads());
 		free(s);
 		return -1;
 	}
@@ -1354,6 +1386,18 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 		report_address("pc ", ctx->pc.x);
 		report_address("lr ", ctx->lr.x);
 		host_log("  far %#lx\n  sp  %#lx\n", (unsigned long)ctx->far.x, (unsigned long)ctx->sp.x);
+		{
+			/* What the guest's memory and the kernel each say of the
+			 * page: a fault in memory that is writable and executable
+			 * by turns should have been turned around. */
+			MemoryInfo info = { 0 };
+			u32 page_info;
+
+			svcQueryMemory(&info, &page_info, ctx->far.x);
+			host_log("  page state %#x; for the kernel, type %#x, permission %#x, %#lx+%#lx\n",
+				 gmem_page_state(ctx->far.x), info.type, info.perm,
+				 (unsigned long)info.addr, (unsigned long)info.size);
+		}
 		for (int i = 0; i < 9; i++)
 			host_log("  x%d  %#lx\n", i, (unsigned long)ctx->cpu_gprs[i].x);
 		host_log("Press + to quit.\n");
@@ -2077,6 +2121,9 @@ static void run(void *arg)
 static void report_kernel_use(void)
 {
 	u64 addr = 0, end = 0, size = 0, blocks = 0, code = 0, shared = 0, heap = 0;
+	/* The guest's, by size (up to 16 KB, 256 KB, 2 MB, and above) and by
+	 * what may be done with them (nothing, read, write, run). */
+	unsigned long sizes[4] = { 0 }, perms[4] = { 0 };
 	int handles = 0;
 
 	svcGetInfo(&addr, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
@@ -2092,9 +2139,11 @@ static void report_kernel_use(void)
 		if (info.type == MemType_Unmapped || info.type == MemType_Reserved)
 			continue;
 		blocks++;
-		if (info.type == MemType_ModuleCodeStatic || info.type == MemType_ModuleCodeMutable)
+		if (info.type == MemType_ModuleCodeStatic || info.type == MemType_ModuleCodeMutable) {
 			code++;
-		else if (info.type == MemType_SharedMem)
+			sizes[info.size <= 0x4000 ? 0 : info.size <= 0x40000 ? 1 : info.size <= 0x200000 ? 2 : 3]++;
+			perms[(info.perm & Perm_X) ? 3 : (info.perm & Perm_W) ? 2 : (info.perm & Perm_R) ? 1 : 0]++;
+		} else if (info.type == MemType_SharedMem)
 			shared++;
 		else if (info.type == MemType_Heap)
 			heap++;
@@ -2106,6 +2155,9 @@ static void report_kernel_use(void)
 		 "%d shared objects; %lu MB of the pool free\n",
 		 (unsigned long)blocks, (unsigned long)code, (unsigned long)shared,
 		 (unsigned long)heap, handles, (unsigned long)(pool_free >> 8));
+	host_log("gx: guest blocks by size: %lu up to 16 KB, %lu to 256 KB, %lu to 2 MB, %lu larger; "
+		 "by use: %lu nothing, %lu read, %lu write, %lu run\n",
+		 sizes[0], sizes[1], sizes[2], sizes[3], perms[0], perms[1], perms[2], perms[3]);
 }
 
 /* Where one thread is: paused for the time it takes to read its registers. */
@@ -2217,6 +2269,7 @@ static void watchdog(void *arg)
 			swaps = gl_swaps;
 		}
 		report_kernel_use();
+		host_log("gx: host threads: %d\n", count_threads() + 1);   /* and this one */
 		gx_report_threads();
 		if (kernel_asked) {
 			host_log("gx: the kernel has not answered for 10 s\n");

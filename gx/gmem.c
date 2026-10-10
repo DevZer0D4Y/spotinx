@@ -260,6 +260,13 @@ static int is_wx(uint8_t state)
 	return (state & (PG_USED | PG_SHARED | PG_COPY | PG_HOLE | PG_PROT)) == (PG_USED | WX_PROT);
 }
 
+/* What is known of the page at addr, for a host to say when a fault there is
+ * not understood: the bits of page_state[], or -1 outside the arena. */
+int gmem_page_state(uint64_t addr)
+{
+	return arena && in_arena(addr, 1) ? page_state[page_of(addr)] : -1;
+}
+
 int gmem_fault(uint64_t addr, int exec)
 {
 	int prot = GX_PROT_READ | (exec ? GX_PROT_EXEC : GX_PROT_WRITE);

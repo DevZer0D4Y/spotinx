@@ -109,6 +109,7 @@ void gmem_report(void);
  * jump to it if exec, a read or a write otherwise): returns whether the access
  * is one to try again. See gmem.c on memory writable and executable. */
 int gmem_fault(uint64_t addr, int exec);
+int gmem_page_state(uint64_t addr);
 
 /* gelf.c */
 struct gx_image {

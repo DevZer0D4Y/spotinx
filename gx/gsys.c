@@ -5,6 +5,7 @@
  * no MMU, no user processes and is built without futexes. Everything else
  * (files, pipes, sockets, time) goes to the kernel through lkl_syscall().
  */
+#include <stdlib.h>
 #include <string.h>
 #include <lkl.h>
 #include "gx.h"
@@ -666,6 +667,21 @@ void gx_report_kernel_memory(void)
 	}
 	line[strlen(line) - 1] = '\n';
 	host_log("%s", line);
+	/* And how many tasks it has, its own threads and the guest's: each of
+	 * its own is a thread of the host, which may have few to give. The
+	 * fourth word of /proc/loadavg is "running/all". */
+	fd = lkl_sys_open("/proc/loadavg", LKL_O_RDONLY, 0);
+	n = fd < 0 ? -1 : lkl_sys_read(fd, text, sizeof(text) - 1);
+	if (fd >= 0)
+		lkl_sys_close(fd);
+	if (n > 0) {
+		const char *slash;
+
+		text[n] = 0;
+		slash = strchr(text, '/');
+		if (slash)
+			host_log("gx: kernel tasks: %ld\n", strtol(slash + 1, NULL, 10));
+	}
 }
 
 void gx_report_threads(void)

@@ -11,6 +11,10 @@ CROSS=aarch64-linux-gnu-
 # The others are what Chromium expects of any Linux: timerfd, signalfd, file
 # locks, inotify, and fadvise/madvise.
 OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS"
+# What LKL's defconfig has and gx has no use for. Each of these keeps threads
+# of the kernel waiting, every one of them a thread of the host, and Horizon
+# gives an application 96 threads in all: a browser needs most of them.
+WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
 
 cd "$LINUX"
 build() { make -C tools/lkl CROSS_COMPILE=$CROSS -j"$(nproc)" >/tmp/lkl-build.log 2>&1 ||
@@ -20,6 +24,9 @@ build() { make -C tools/lkl CROSS_COMPILE=$CROSS -j"$(nproc)" >/tmp/lkl-build.lo
 [ -e .config ] || build
 for opt in $OPTIONS; do
 	scripts/config --enable "$opt"
+done
+for opt in $WITHOUT; do
+	scripts/config --disable "$opt"
 done
 make ARCH=lkl olddefconfig >/dev/null
 for opt in $OPTIONS; do

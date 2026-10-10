@@ -25,6 +25,9 @@ PC_SYSROOT=$PC_OUT/sysroot
 CROSS=aarch64-none-elf-
 # UNIX: AF_UNIX sockets and socketpair(), as in build-lkl.sh.
 OPTIONS="UNIX TIMERFD SIGNALFD FILE_LOCKING INOTIFY_USER ADVISE_SYSCALLS"
+# And without these, as in build-lkl.sh: threads of the kernel nothing here
+# uses, out of the 96 an application may have.
+WITHOUT="XFS_FS BTRFS_FS BLK_DEV_NVME NVME_CORE IPV6"
 
 mkdir -p "$OUT/obj" "$OUT/lkl"
 
@@ -36,6 +39,14 @@ for opt in $OPTIONS; do
 	grep -q "^CONFIG_$opt=y" "$LINUX/arch/lkl/configs/defconfig" ||
 		echo "CONFIG_$opt=y" >>"$LINUX/arch/lkl/configs/defconfig"
 done
+for opt in $WITHOUT; do
+	if ! grep -q "^# CONFIG_$opt is not set" "$LINUX/arch/lkl/configs/defconfig"; then
+		sed -i "/^CONFIG_$opt=/d" "$LINUX/arch/lkl/configs/defconfig"
+		echo "# CONFIG_$opt is not set" >>"$LINUX/arch/lkl/configs/defconfig"
+		# The kernel is to be made again with it.
+		rm -f "$LKL/lib/lkl.o" "$LINUX/.config"
+	fi
+done
 if [ ! -e "$LKL/lib/lkl.o" ]; then
 	make -C "$LKL" CROSS_COMPILE=$CROSS -j"$(nproc)" "$LKL/lib/lkl.o" >"$OUT/kernel.log" 2>&1 ||
 		{ tail -n 40 "$OUT/kernel.log"; exit 1; }
@@ -43,6 +54,10 @@ fi
 for opt in $OPTIONS; do
 	grep -q "^CONFIG_$opt=y" "$LINUX/.config" ||
 		{ echo "CONFIG_$opt is not in the kernel: remove $LKL/lib/lkl.o and $LINUX/.config"; exit 1; }
+done
+for opt in $WITHOUT; do
+	! grep -q "^CONFIG_$opt=y" "$LINUX/.config" ||
+		{ echo "CONFIG_$opt is still in the kernel: remove $LKL/lib/lkl.o and $LINUX/.config"; exit 1; }
 done
 if [ ! -e "$OUT/lkl-nro.o" ] || [ "$LKL/lib/lkl.o" -nt "$OUT/lkl-nro.o" ]; then
 	# Without debug information, and with .rodata writable: the kernel's
