@@ -30,7 +30,7 @@ CHROMIUM=/usr/lib/chromium/chromium-headless-shell
 FULL_FLAGS="--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile \
 --no-first-run --no-default-browser-check --disable-breakpad --disable-crashpad-for-testing --test-type \
 --password-store=basic --disable-background-networking --disable-component-update \
---disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic --hide-crash-restore-bubble"
+--disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic --hide-crash-restore-bubble --enable-spatial-navigation --remote-debugging-pipe"
 # Where its address bar is, for gx (-A).
 FULL_ADDRESS=225,46,1150,80
 
@@ -173,7 +173,7 @@ if [ "${1:-}" = full ]; then
 	# from an empty one.
 	[ -z "${GX_FRESH:-}" ] || rm -f "$OUT/profile-pc.ext4"
 	[ -e "$OUT/profile-pc.ext4" ] || cp "$OUT/profile.ext4" "$OUT/profile-pc.ext4" || exit 1
-	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -A $FULL_ADDRESS \
+	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -b -A $FULL_ADDRESS \
 		-p "$OUT/profile-pc.ext4" \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$OUT/chromium-full-switch.ext4" \
 		/usr/lib/chromium/chromium $FULL_FLAGS --disable-gpu ${GX_JS---js-flags=--jitless} \

@@ -27,6 +27,12 @@
 static int next_id = 1;
 static int window;          /* Chromium shows itself: see cdp_start() */
 static int ask, wanted, page_action;   /* between wl.c's thread and ours */
+/* With a window there may be several pages, one per tab, each with a session
+ * of its own; they come and go as tabs do. */
+#define MAX_PAGES 16
+static char pages[MAX_PAGES][128];
+static int page_count;
+static uint64_t ask_deadline;
 
 /*
  * What every page is given when Chromium has a window: a way to tell whether
@@ -124,26 +130,42 @@ static void send_text(const char *text, size_t len)
 	}
 }
 
+/* Sends a command to a session, or to the browser itself if to is "". */
+static void send_command(const char *to, const char *method, const char *params)
+{
+	char text[3400];
+	int n;
+
+	if (to[0])
+		n = snprintf(text, sizeof(text), "{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"%s\",\"params\":%s}",
+			     next_id++, to, method, params);
+	else
+		n = snprintf(text, sizeof(text), "{\"id\":%d,\"method\":\"%s\",\"params\":%s}",
+			     next_id++, method, params);
+	if (n > 0 && n < (int)sizeof(text))
+		send_text(text, n);
+}
+
 /* Sends a command to the page (or to the browser before there is a page). */
 static void command(const char *method, const char *params_fmt, ...)
 {
-	char params[3072] = "{}", text[3400];
+	char params[3072] = "{}";
 	va_list ap;
-	int n;
 
 	if (params_fmt) {
 		va_start(ap, params_fmt);
 		vsnprintf(params, sizeof(params), params_fmt, ap);
 		va_end(ap);
 	}
-	if (session[0])
-		n = snprintf(text, sizeof(text), "{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"%s\",\"params\":%s}",
-			     next_id++, session, method, params);
-	else
-		n = snprintf(text, sizeof(text), "{\"id\":%d,\"method\":\"%s\",\"params\":%s}",
-			     next_id++, method, params);
-	if (n > 0 && n < (int)sizeof(text))
-		send_text(text, n);
+	send_command(session, method, params);
+}
+
+/* Sends a command to every page there is. */
+static void page_command(const char *method, const char *params)
+{
+	for (int i = 0; i < MAX_PAGES; i++)
+		if (pages[i][0])
+			send_command(pages[i], method, params);
 }
 
 /* Copies the string value of "key" out of a message; returns its length, or
@@ -224,29 +246,75 @@ static void json_escape(char *out, size_t room, const char *text)
 	out[n] = 0;
 }
 
+/* With a window: pages that appear are given the script, and what they say
+ * is passed on to wl.c. */
+static void handle_window_message(const char *message)
+{
+	char id[128];
+
+	if (strstr(message, "\"method\":\"Target.attachedToTarget\"")) {
+		char script[2048], params[2200];
+		int slot = -1;
+
+		if (!strstr(message, "\"type\":\"page\"") ||
+		    string_value(message, "sessionId", id, sizeof(id)) <= 0)
+			return;
+		for (int i = 0; i < MAX_PAGES; i++) {
+			if (!strcmp(pages[i], id))
+				return;
+			if (slot < 0 && !pages[i][0])
+				slot = i;
+		}
+		if (slot < 0)
+			return;
+		strcpy(pages[slot], id);
+		json_escape(script, sizeof(script), page_script);
+		send_command(id, "Runtime.enable", "{}");
+		send_command(id, "Runtime.addBinding", "{\"name\":\"gxEdit\"}");
+		send_command(id, "Page.enable", "{}");
+		snprintf(params, sizeof(params), "{\"source\":\"%s\"}", script);
+		send_command(id, "Page.addScriptToEvaluateOnNewDocument", params);
+		snprintf(params, sizeof(params), "{\"expression\":\"%s\"}", script);
+		send_command(id, "Runtime.evaluate", params);
+		/* The first page has the keyboard from the start, not the
+		 * address above it. */
+		if (!__atomic_fetch_add(&page_count, 1, __ATOMIC_SEQ_CST))
+			send_command(id, "Page.bringToFront", "{}");
+	} else if (strstr(message, "\"method\":\"Target.detachedFromTarget\"")) {
+		if (string_value(message, "sessionId", id, sizeof(id)) <= 0)
+			return;
+		for (int i = 0; i < MAX_PAGES; i++)
+			if (!strcmp(pages[i], id))
+				pages[i][0] = 0;
+	} else if (strstr(message, "\"method\":\"Runtime.bindingCalled\"") &&
+		   strstr(message, "\"name\":\"gxEdit\"")) {
+		__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
+	} else if (ask_deadline && strstr(message, "\"value\":\"gx-text\"")) {
+		/* Only while the question is open: an answer that comes after
+		 * we stopped waiting has been acted on already. */
+		ask_deadline = 0;
+		__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
+	} else if (ask_deadline && strstr(message, "\"value\":\"gx-other\"")) {
+		ask_deadline = 0;
+		__atomic_store_n(&wanted, CDP_ENTER, __ATOMIC_SEQ_CST);
+	}
+}
+
 static void handle_message(char *message, size_t len)
 {
 	static char frame_session[32];
 	char *data;
 
+	if (window) {
+		handle_window_message(message);
+		return;
+	}
 	if (!session[0]) {
 		/* The answer to Target.getTargets, or to Target.attachToTarget. */
 		char target[128];
 		const char *page = strstr(message, "\"type\":\"page\"");
 
-		if (string_value(message, "sessionId", session, sizeof(session)) > 0 && window) {
-			char script[2048];
-
-			json_escape(script, sizeof(script), page_script);
-			command("Runtime.enable", NULL);
-			command("Runtime.addBinding", "{\"name\":\"gxEdit\"}");
-			command("Page.enable", NULL);
-			command("Page.addScriptToEvaluateOnNewDocument", "{\"source\":\"%s\"}", script);
-			command("Runtime.evaluate", "{\"expression\":\"%s\"}", script);
-			/* The page has the keyboard from the start, not the
-			 * address above it. */
-			command("Page.bringToFront", NULL);
-		} else if (session[0]) {
+		if (string_value(message, "sessionId", session, sizeof(session)) > 0) {
 			command("Page.enable", NULL);
 			command("Page.startScreencast",
 				"{\"format\":\"jpeg\",\"quality\":70,\"maxWidth\":1280,\"maxHeight\":720}");
@@ -260,16 +328,6 @@ static void handle_message(char *message, size_t len)
 				command("Target.attachToTarget", "{\"targetId\":\"%s\",\"flatten\":true}",
 					target);
 		}
-		return;
-	}
-	if (window) {
-		if (strstr(message, "\"method\":\"Runtime.bindingCalled\"") &&
-		    strstr(message, "\"name\":\"gxEdit\""))
-			__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
-		else if (strstr(message, "\"value\":\"gx-text\""))
-			__atomic_store_n(&wanted, CDP_KEYBOARD, __ATOMIC_SEQ_CST);
-		else if (strstr(message, "\"value\":\"gx-other\""))
-			__atomic_store_n(&wanted, CDP_ENTER, __ATOMIC_SEQ_CST);
 		return;
 	}
 	if (!strstr(message, "\"method\":\"Page.screencastFrame\""))
@@ -393,28 +451,52 @@ static void cdp_thread(void *arg)
 			if (len == MESSAGE_MAX - 1)
 				len = 0;   /* not a message we can do anything with */
 		}
+		if (window) {
+			/* The page that is on the screen is the one that acts:
+			 * the others are told the same and know they are not it. */
+			static const char seen[] = "document.visibilityState=='visible'";
+			char params[512];
+
+			/* Pages are handed to us as they appear, once the browser
+			 * has heard that we want them. */
+			if (!page_count && waited++ % 50 == 0)
+				send_command("", "Target.setAutoAttach", "{\"autoAttach\":true,"
+					     "\"waitForDebuggerOnStart\":false,\"flatten\":true}");
+			switch (__atomic_exchange_n(&page_action, CDP_NONE, __ATOMIC_SEQ_CST)) {
+			case CDP_BACK:
+				snprintf(params, sizeof(params), "{\"expression\":\"if(%s)history.back()\"}", seen);
+				page_command("Runtime.evaluate", params);
+				break;
+			case CDP_RELOAD:
+				snprintf(params, sizeof(params), "{\"expression\":\"if(%s)location.reload()\"}", seen);
+				page_command("Runtime.evaluate", params);
+				break;
+			case CDP_NAVIGATE:
+				snprintf(params, sizeof(params), "{\"expression\":\"if(%s)window.focus()\"}", seen);
+				page_command("Runtime.evaluate", params);
+				page_command("Page.bringToFront", "{}");
+				break;
+			}
+			if (__atomic_exchange_n(&ask, 0, __ATOMIC_SEQ_CST)) {
+				/* A page that does not have the keys says nothing we
+				 * act on: they are the window's then (its address),
+				 * and no answer in half a second is Enter. */
+				snprintf(params, sizeof(params), "{\"expression\":\"(%s&&document.hasFocus())?"
+					 "(window.__gxText&&__gxText()?'gx-text':'gx-other'):'gx-away'\","
+					 "\"returnByValue\":true}", seen);
+				page_command("Runtime.evaluate", params);
+				ask_deadline = host_now_ns() + 500000000ULL;
+			}
+			if (ask_deadline && host_now_ns() > ask_deadline) {
+				ask_deadline = 0;
+				__atomic_store_n(&wanted, CDP_ENTER, __ATOMIC_SEQ_CST);
+			}
+			continue;
+		}
 		if (!session[0]) {
 			/* Until the page exists, keep asking where it is. */
 			if (waited++ % 50 == 0)
 				command("Target.getTargets", NULL);
-			continue;
-		}
-		if (window) {
-			/* wl.c has the user; we have its questions. */
-			switch (__atomic_exchange_n(&page_action, CDP_NONE, __ATOMIC_SEQ_CST)) {
-			case CDP_BACK:
-				command("Runtime.evaluate", "{\"expression\":\"history.back()\"}");
-				break;
-			case CDP_RELOAD:
-				command("Page.reload", NULL);
-				break;
-			case CDP_NAVIGATE:
-				command("Page.bringToFront", NULL);
-				break;
-			}
-			if (__atomic_exchange_n(&ask, 0, __ATOMIC_SEQ_CST))
-				command("Runtime.evaluate", "{\"expression\":\"window.__gxText&&"
-					"__gxText()?'gx-text':'gx-other'\",\"returnByValue\":true}");
 			continue;
 		}
 		while (host_input(&in)) {
@@ -428,7 +510,7 @@ static void cdp_thread(void *arg)
 
 int cdp_activate(void)
 {
-	if (!window || !session[0])
+	if (!window || !page_count)
 		return 0;
 	__atomic_store_n(&ask, 1, __ATOMIC_SEQ_CST);
 	return 1;
@@ -436,7 +518,7 @@ int cdp_activate(void)
 
 int cdp_page(int what)
 {
-	if (!window || !session[0])
+	if (!window || !page_count)
 		return 0;
 	__atomic_store_n(&page_action, what, __ATOMIC_SEQ_CST);
 	return 1;

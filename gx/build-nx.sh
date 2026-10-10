@@ -187,7 +187,7 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 	# next to itself the first time (profile.ext4, which is then the user's:
 	# nothing here replaces it).
 	[ ! -e "$PC_OUT/profile.ext4.gz" ] || cp "$PC_OUT/profile.ext4.gz" "$APP/profile.ext4.gz"
-	echo "[Chromium, the whole browser (trial, no GPU)] -w @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") --disable-gpu --enable-spatial-navigation https://www.google.com/" >>"$APP/programs.txt"
+	echo "[Chromium, the whole browser (trial, no GPU)] -w -b @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"
