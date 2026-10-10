@@ -171,12 +171,15 @@ if [ "${1:-}" = full ]; then
 	export GX_FRAMES=$OUT/chromium-frames GX_INPUT=${GX_INPUT:-}
 	# Its profile is kept from one run here to the next; GX_FRESH=1 starts
 	# from an empty one.
+	# GX_GPU=1: drawn with GLES, through ANGLE and gx's libEGL and libGLESv2.
+	gpu="--disable-gpu"
+	[ -z "${GX_GPU:-}" ] || gpu="--use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu"
 	[ -z "${GX_FRESH:-}" ] || rm -f "$OUT/profile-pc.ext4"
 	[ -e "$OUT/profile-pc.ext4" ] || cp "$OUT/profile.ext4" "$OUT/profile-pc.ext4" || exit 1
 	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -b -A $FULL_ADDRESS \
 		-p "$OUT/profile-pc.ext4" \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$OUT/chromium-full-switch.ext4" \
-		/usr/lib/chromium/chromium $FULL_FLAGS --disable-gpu ${GX_JS---js-flags=--jitless} \
+		/usr/lib/chromium/chromium $FULL_FLAGS $gpu ${GX_JS---js-flags=--jitless} \
 		"${@:-file:///usr/share/gx/page.html}"
 fi
 if [ "${1:-}" = wayland ]; then

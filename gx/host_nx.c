@@ -52,6 +52,7 @@
 #include "nat.h"
 #include "cdp.h"
 #include "wl.h"
+#include "glwin.h"
 
 /* Where everything is on the SD card: the root image next to the program, the
  * log, and programs.txt if there is to be a menu. */
@@ -969,9 +970,19 @@ static EGLDisplay gl_get_platform_display(EGLenum platform, void *native, const 
 
 static EGLSurface window_surface = EGL_NO_SURFACE;
 
-/* The guest's window is the screen, which the console gives up. */
-static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
-					   const void *attribs)
+static volatile unsigned gl_swaps;
+
+/* A function of the EGL and GLES linked in, the real one, by its name. */
+static void *gl_raw(const char *name)
+{
+	for (const struct gx_gl_entry *e = gx_gl_table; e->name; e++)
+		if (!strcmp(name, e->name))
+			return (void *)e->fn;
+	return (void *)eglGetProcAddress(name);
+}
+
+/* The screen, for glwin.c, which the console gives up. */
+static void *gl_screen(void *dpy, void *config)
 {
 	console_off();
 	window_surface = eglCreateWindowSurface(dpy, config, nwindowGetDefault(), NULL);
@@ -979,7 +990,34 @@ static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, voi
 		host_log("gx: gl: no window surface (%#x)\n", eglGetError());
 	else
 		host_log("gx: gl: the guest has the screen\n");
-	return window_surface;
+	return window_surface == EGL_NO_SURFACE ? NULL : window_surface;
+}
+
+static void gl_presented(void *dpy, void *screen)
+{
+	gl_swaps++;
+}
+
+static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented };
+
+/* The guest's windows are glwin.c's: it puts them together on the screen. */
+static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
+					   const void *attribs)
+{
+	void *surface;
+
+	glwin_init(&gl_host);
+	surface = glwin_create(dpy, config, window);
+	if (!surface)
+		host_log("gx: gl: no surface for a window (%#x)\n", eglGetError());
+	return surface ? surface : EGL_NO_SURFACE;
+}
+
+static EGLBoolean gl_destroy_surface(EGLDisplay dpy, EGLSurface surface)
+{
+	int done = glwin_destroy(dpy, surface);
+
+	return done < 0 ? eglDestroySurface(dpy, surface) : done;
 }
 
 /* Mesa on the Switch says a window surface is 0 by 0 (seen on hardware, at
@@ -987,9 +1025,12 @@ static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, voi
 static EGLBoolean gl_query_surface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
 				   EGLint *value)
 {
-	EGLBoolean ret = eglQuerySurface(dpy, surface, attribute, value);
+	EGLBoolean ret;
 	u32 width = 0, height = 0;
 
+	if (glwin_query(surface, attribute, value))
+		return EGL_TRUE;
+	ret = eglQuerySurface(dpy, surface, attribute, value);
 	if (ret && value && *value <= 0 && surface == window_surface &&
 	    (attribute == EGL_WIDTH || attribute == EGL_HEIGHT) &&
 	    R_SUCCEEDED(nwindowGetDimensions(nwindowGetDefault(), &width, &height)))
@@ -1007,16 +1048,11 @@ static EGLBoolean gl_terminate(EGLDisplay dpy)
 
 /* What follows only watches: a guest that draws with the GPU (a Chromium told
  * to) says little about why it gave up, and the log is all there is to go by. */
-static volatile unsigned gl_swaps;
-
 static EGLBoolean gl_swap_buffers(EGLDisplay dpy, EGLSurface surface)
 {
-	EGLBoolean ret = eglSwapBuffers(dpy, surface);
+	int done = glwin_swap(dpy, surface);
 
-	if (!ret && !gl_swaps)
-		host_log("gx: gl: eglSwapBuffers failed (%#x)\n", eglGetError());
-	gl_swaps++;
-	return ret;
+	return done < 0 ? eglSwapBuffers(dpy, surface) : done;
 }
 
 /* With the parts that changed: the whole of it is shown all the same. */
@@ -1254,6 +1290,7 @@ void *host_symbol(const char *name)
 		{ "eglQuerySurface", gl_query_surface },
 		{ "eglTerminate", gl_terminate },
 		{ "eglSwapBuffers", gl_swap_buffers },
+		{ "eglDestroySurface", gl_destroy_surface },
 		{ "eglSwapBuffersWithDamageKHR", gl_swap_buffers_with_damage },
 		{ "eglSwapBuffersWithDamageEXT", gl_swap_buffers_with_damage },
 		{ "eglInitialize", gl_initialize },

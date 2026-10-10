@@ -23,6 +23,12 @@ int wl_start(void);
 void wl_close(void);
 int wl_closed(void);
 
+/* For glwin.c, by the number a wl_surface has on the wire: where it goes on
+ * the screen (1 if it is the window, 2 and up for popups in the order they
+ * are laid, 0 if it is neither), and the size it is drawn at. */
+int wl_surface_place(uint32_t surface, int *x, int *y);
+void wl_surface_size(uint32_t surface, int width, int height);
+
 /* Where the window has the address of the page, for the keyboard to come up
  * when it is touched or asked for: chromium-shell's if this is not called. */
 void wl_address_bar(int left, int top, int right, int bottom);

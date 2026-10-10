@@ -28,7 +28,7 @@ echo "== gx"
 # finds the loader and the libraries in the arm64 packages of the image.
 $CC -O2 -g -Wall -Wextra -Wno-unused-parameter -DGX_ARENA_SIZE='(256UL << 30)' \
 	-I"$LKL/include" -I"$SRC" \
-	"$SRC"/tramp.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/host_posix.c \
+	"$SRC"/tramp.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/host_posix.c \
 	"$LKL/liblkl.a" -lpthread -lrt -ldl \
 	-o "$OUT/gx" || exit 1
 

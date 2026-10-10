@@ -361,6 +361,42 @@ static void show(struct object *surface, uint32_t surface_id)
 	event(surface->pending, 0, "");   /* wl_buffer.release */
 }
 
+/* For the host's GL (glwin.c), whose windows are not pictures that come
+ * through here: where a surface goes. 1 for the window, 2 and up for the
+ * popups in the order they are laid, 0 for anything else. */
+int wl_surface_place(uint32_t surface, int *x, int *y)
+{
+	int order = 0;
+
+	if (!surface)
+		return 0;
+	*x = *y = 0;
+	if (surface == main_surface)
+		return 1;
+	for (int i = 0; i < MAX_POPUPS; i++) {
+		if (!popups[i].id)
+			continue;
+		if (popups[i].surface == surface) {
+			*x = popups[i].x;
+			*y = popups[i].y;
+			return 2 + order;
+		}
+		order++;
+	}
+	return 0;
+}
+
+/* And how large it has drawn it, which says what a finger is on. */
+void wl_surface_size(uint32_t surface, int width, int height)
+{
+	struct popup *p = popup_of(surface);
+
+	if (p && !p->pixels) {
+		p->width = width;
+		p->height = height;
+	}
+}
+
 static void popup_gone(struct popup *p)
 {
 	free(p->pixels);
@@ -425,6 +461,7 @@ static void commit(uint32_t id)
 		} else if (p && p->pixels) {
 			free(p->pixels);
 			p->pixels = NULL;
+			p->width = p->height = 0;
 			compose();
 		}
 		surface->pending = 0;
@@ -935,7 +972,7 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		for (int i = 0; i < MAX_POPUPS; i++) {
 			const struct popup *p = &popups[i];
 
-			if (p->id && p->pixels && in->x >= p->x && in->x < p->x + p->width &&
+			if (p->id && p->width > 0 && in->x >= p->x && in->x < p->x + p->width &&
 			    in->y >= p->y && in->y < p->y + p->height) {
 				touch_surface = p->surface;
 				touch_dx = p->x;

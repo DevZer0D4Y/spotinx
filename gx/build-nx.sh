@@ -104,7 +104,7 @@ CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256
 	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=
-for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/host_nx.c \
+for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/host_nx.c \
 	"$OUT"/gl_table.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
 	"$OUT"/lkl/utils.c "$OUT"/lkl/virtio.c "$OUT"/lkl/virtio_net.c "$OUT"/lkl/virtio_blk.c \
 	"$OUT"/lkl/net.c "$OUT"/lkl/fs.c; do
@@ -187,7 +187,9 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 	# next to itself the first time (profile.ext4, which is then the user's:
 	# nothing here replaces it).
 	[ ! -e "$PC_OUT/profile.ext4.gz" ] || cp "$PC_OUT/profile.ext4.gz" "$APP/profile.ext4.gz"
-	echo "[Chromium, the whole browser (trial, no GPU)] -w -b @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
+	F="-w -b @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd")"
+	echo "[Chromium, the whole browser (GPU)] $F --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu https://www.google.com/" >>"$APP/programs.txt"
+	echo "[Chromium, the whole browser (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

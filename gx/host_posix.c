@@ -43,6 +43,7 @@
 #include "nat.h"
 #include "cdp.h"
 #include "wl.h"
+#include "glwin.h"
 
 static void export_file(void);
 static const char *export_spec;
@@ -384,7 +385,10 @@ static unsigned gl_get_config_attrib(void *dpy, void *config, int32_t attribute,
 	return ret;
 }
 
-static void *gl_create_window_surface(void *dpy, void *config, void *window, const void *attribs)
+static void save_frame(const char *path, void *dpy, void *surface);
+
+/* The screen, for glwin.c: an off-screen buffer of its size. */
+static void *gl_screen(void *dpy, void *config)
 {
 	static const int32_t screen[] = {
 		EGL_WIDTH, SCREEN_WIDTH, EGL_HEIGHT, SCREEN_HEIGHT, EGL_NONE,
@@ -392,6 +396,38 @@ static void *gl_create_window_surface(void *dpy, void *config, void *window, con
 	void *(*create)(void *, void *, const int32_t *) = gl_real("eglCreatePbufferSurface");
 
 	return create(dpy, config, screen);
+}
+
+static void gl_presented(void *dpy, void *screen)
+{
+	const char *path = getenv("GX_FRAME");
+
+	if (path)
+		save_frame(path, dpy, screen);
+}
+
+static const struct glwin_host gl_host = { gl_real, gl_screen, gl_presented };
+
+/* The guest's windows are glwin.c's: it puts them together on the screen. */
+static void *gl_create_window_surface(void *dpy, void *config, void *window, const void *attribs)
+{
+	glwin_init(&gl_host);
+	return glwin_create(dpy, config, window);
+}
+
+static unsigned gl_destroy_surface(void *dpy, void *surface)
+{
+	unsigned (*destroy)(void *, void *) = gl_real("eglDestroySurface");
+	int done = glwin_destroy(dpy, surface);
+
+	return done < 0 ? destroy(dpy, surface) : (unsigned)done;
+}
+
+static unsigned gl_query_surface(void *dpy, void *surface, int32_t attribute, int32_t *value)
+{
+	unsigned (*query)(void *, void *, int32_t, int32_t *) = gl_real("eglQuerySurface");
+
+	return glwin_query(surface, attribute, value) ? 1 : query(dpy, surface, attribute, value);
 }
 
 static void save_frame(const char *path, void *dpy, void *surface)
@@ -436,11 +472,14 @@ static void gl_debug_message_callback(void *callback, const void *param)
 static unsigned gl_swap_buffers(void *dpy, void *surface)
 {
 	unsigned (*swap)(void *, void *) = gl_real("eglSwapBuffers");
-	const char *path = getenv("GX_FRAME");
+	int done = glwin_swap(dpy, surface);
 
-	if (path)
-		save_frame(path, dpy, surface);
-	return swap(dpy, surface);
+	return done < 0 ? swap(dpy, surface) : (unsigned)done;
+}
+
+static unsigned gl_swap_buffers_with_damage(void *dpy, void *surface, const int32_t *rects, int32_t count)
+{
+	return gl_swap_buffers(dpy, surface);
 }
 
 /* ---------- host functions for the guest: sound ---------- */
@@ -556,6 +595,10 @@ void *host_symbol(const char *name)
 		{ "eglCreatePlatformWindowSurface", gl_create_window_surface },
 		{ "eglCreatePlatformWindowSurfaceEXT", gl_create_window_surface },
 		{ "eglSwapBuffers", gl_swap_buffers },
+		{ "eglSwapBuffersWithDamageKHR", gl_swap_buffers_with_damage },
+		{ "eglSwapBuffersWithDamageEXT", gl_swap_buffers_with_damage },
+		{ "eglDestroySurface", gl_destroy_surface },
+		{ "eglQuerySurface", gl_query_surface },
 		{ "glDebugMessageCallback", gl_debug_message_callback },
 		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 	};
