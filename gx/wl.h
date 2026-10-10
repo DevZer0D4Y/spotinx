@@ -17,6 +17,12 @@
  * XDG_RUNTIME_DIR=/run and WAYLAND_DISPLAY=wayland-0. */
 int wl_start(void);
 
+/* Asks the window to close, the way its user would, so that the program
+ * behind it ends as it means to; wl_closed() says when it is gone. If it does
+ * not go, host_exit() is called after a few seconds all the same. */
+void wl_close(void);
+int wl_closed(void);
+
 /* Where the window has the address of the page, for the keyboard to come up
  * when it is touched or asked for: chromium-shell's if this is not called. */
 void wl_address_bar(int left, int top, int right, int bottom);

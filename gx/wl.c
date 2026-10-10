@@ -475,6 +475,14 @@ static void frame_tick(uint64_t now)
 	callback_count = 0;
 }
 
+/* Leaving: see wl_close(). A browser run as one process closes its window at
+ * once and then takes seconds to write things down, without ever ending:
+ * with 2.5 s after the window was gone its cookies were not on the disk yet,
+ * with 8 s in all they were. */
+#define CLOSE_NS 8000000000ULL
+
+static uint64_t closing_since;
+
 /* ---------- requests, from the client ---------- */
 
 static int take_fd(void)
@@ -1007,12 +1015,36 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		press_key(14, 0, ms);
 		break;
 	case CDP_QUIT:
-		if (gx_trace) {
-			gmem_report();
-			gx_report_kernel_memory();
-		}
-		host_exit(0);
+		wl_close();
+		break;
 	}
+}
+
+/*
+ * Leaving. The window is asked to close, as a click on its cross would: a
+ * browser then writes what it had not got round to writing (its cookies, a
+ * page's storage, where it was) and ends by itself. It is given a while, and
+ * the program is ended without it if it does not.
+ */
+static int close_wanted, client_gone;
+
+void wl_close(void)
+{
+	__atomic_store_n(&close_wanted, 1, __ATOMIC_SEQ_CST);
+}
+
+int wl_closed(void)
+{
+	return __atomic_load_n(&client_gone, __ATOMIC_SEQ_CST);
+}
+
+static void leave(void)
+{
+	if (gx_trace) {
+		gmem_report();
+		gx_report_kernel_memory();
+	}
+	host_exit(0);
 }
 
 /*
@@ -1201,9 +1233,23 @@ static void wl_thread(void *arg)
 		}
 		edit_step(now);
 		frame_tick(now);
+		if (__atomic_load_n(&close_wanted, __ATOMIC_SEQ_CST) && !closing_since) {
+			struct object *window = &objects[main_surface < MAX_OBJECTS ? main_surface : 0];
+
+			closing_since = now ? now : 1;
+			if (window->toplevel)
+				event(window->toplevel, 1, "");   /* xdg_toplevel.close */
+		}
+		if (closing_since && now - closing_since > CLOSE_NS) {
+			host_log("gx: wayland: the client did not close by itself\n");
+			leave();
+		}
 		flush();
 	}
 	host_log("gx: wayland: the client left after %d pictures\n", frames);
+	__atomic_store_n(&client_gone, 1, __ATOMIC_SEQ_CST);
+	if (closing_since)
+		leave();
 }
 
 int wl_start(void)

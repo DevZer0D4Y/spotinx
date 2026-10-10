@@ -2553,6 +2553,14 @@ int main(int argc, char **argv)
 	}
 	/* Kernel and guest threads cannot be stopped one by one; ending the
 	 * process is the only clean way out (back to the HOME menu). */
+	/* A browser first: asked to close, it writes what it was keeping in
+	 * memory (cookies among it) and ends by itself. */
+	if (wayland) {
+		wl_close();
+		for (int i = 0; i < 1000 && !finished && !wl_closed(); i++)
+			svcSleepThread(10000000ULL);
+		svcSleepThread(300000000ULL);
+	}
 	leaving = 1;
 	for (int i = 0; i < 500 && profile_mounted && !left; i++)
 		svcSleepThread(10000000ULL);   /* five seconds at most: the kernel may be stuck */
