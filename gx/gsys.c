@@ -412,8 +412,18 @@ static long dispatch(struct gx_frame *f, struct gx_thread *self)
 	}
 
 	switch (nr) {
-	case 222: return gmem_mmap(f->x[0], f->x[1], (int)f->x[2], (int)f->x[3],
-				   (int)f->x[4], f->x[5]);
+	case 222: {
+		long ret = gmem_mmap(f->x[0], f->x[1], (int)f->x[2], (int)f->x[3], (int)f->x[4], f->x[5]);
+		static int said;
+
+		/* A program that is refused memory seldom says so before it
+		 * stops: the first few refusals are worth a line. (Not those of
+		 * hundreds of gigabytes of addresses: a browser tries sizes.) */
+		if (ret < 0 && ret > -4096 && ret != -19 && f->x[1] < (1UL << 30) && said < 12 && ++said)
+			host_log("gx: mmap of %lu KB (protection %d, flags %#x, file %d) refused: %ld\n",
+				 (unsigned long)(f->x[1] >> 10), (int)f->x[2], (int)f->x[3], (int)f->x[4], ret);
+		return ret;
+	}
 	case 215: return gmem_munmap(f->x[0], f->x[1]);
 	case 226: return gmem_mprotect(f->x[0], f->x[1], (int)f->x[2]);
 	case 214: return gmem_brk(f->x[0]);
@@ -519,6 +529,13 @@ static long dispatch(struct gx_frame *f, struct gx_thread *self)
 		if ((ret == -27 /* EFBIG */ || ret == -GX_ENOMEM) && (long)f->x[1] > 0 &&
 		    lkl_sys_pwrite64(fd, "", 1, f->x[1] - 1) == 1)
 			ret = 0;
+		if (ret < 0) {
+			static int said;
+
+			if (said < 12 && ++said)
+				host_log("gx: a file could not be made %lu KB long: %ld\n",
+					 (unsigned long)(f->x[1] >> 10), ret);
+		}
 		return ret;
 	}
 	case 25:                           /* fcntl */
@@ -621,6 +638,7 @@ void gx_report_kernel_memory(void)
 {
 	static const char *const wanted[] = { "MemTotal", "MemFree", "Cached", "Unevictable", "Slab" };
 	char text[2048], line[160] = "gx: kernel memory:";
+	long free_kb = 0, cached_kb = 0;
 	int fd = lkl_sys_open("/proc/meminfo", LKL_O_RDONLY, 0);
 	long n = fd < 0 ? -1 : lkl_sys_read(fd, text, sizeof(text) - 1);
 
@@ -646,6 +664,10 @@ void gx_report_kernel_memory(void)
 				;
 			for (; *at >= '0' && *at <= '9'; at++)
 				kb = kb * 10 + *at - '0';
+			if (i == 1)
+				free_kb = kb;
+			else if (i == 2)
+				cached_kb = kb;
 			if (strlen(line) < sizeof(line) - 40) {
 				char *end = line + strlen(line);
 				char digits[16];
@@ -667,6 +689,22 @@ void gx_report_kernel_memory(void)
 	}
 	line[strlen(line) - 1] = '\n';
 	host_log("%s", line);
+	/* The kernel keeps what it read of files in its memory, all of it it
+	 * can: a root image is read once into the guest's own memory and that
+	 * copy serves nothing, but it leaves the kernel's memory in crumbs, and
+	 * what needs a piece of some size (shared memory, a socket's buffer)
+	 * is then refused. It is told to let go when little is left. */
+	if (free_kb < (160 << 10) && cached_kb > (128 << 10)) {
+		static int said;
+		int drop = lkl_sys_open("/proc/sys/vm/drop_caches", LKL_O_WRONLY, 0);
+
+		if (drop >= 0) {
+			lkl_sys_write(drop, "1\n", 2);
+			lkl_sys_close(drop);
+		} else if (!said++) {
+			host_log("gx: the kernel cannot be told to drop what it cached (%d)\n", drop);
+		}
+	}
 	/* And how many tasks it has, its own threads and the guest's: each of
 	 * its own is a thread of the host, which may have few to give. The
 	 * fourth word of /proc/loadavg is "running/all". */
