@@ -26,13 +26,25 @@
 #include <sys/socket.h>
 #include <lkl_host.h>
 #include "nat.h"
+#include "gx.h"
+
+/* Says what went wrong, the first few times of each kind: a page that does
+ * not load leaves nothing else to tell why. */
+#define COMPLAIN(...)                                \
+	do {                                         \
+		static int said;                     \
+		if (said < 6 && ++said)              \
+			host_log("gx: nat: " __VA_ARGS__); \
+	} while (0)
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
-#define MAX_TCP 48
-#define MAX_UDP 16
+/* A browser keeps a hundred connections open and asks for names by the dozen,
+ * each question from a port of its own. */
+#define MAX_TCP 160
+#define MAX_UDP 64
 #define QUEUE_FRAMES 256
 #define FRAME_MAX 1514
 #define MSS 1460
@@ -290,9 +302,15 @@ static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t 
 		c->fd = c->buf ? socket(AF_INET, SOCK_STREAM, 0) : -1;
 	}
 	if (!c || c->fd < 0) {
+		/* No room for it now: nothing is answered, and the guest asks
+		 * again in a second, when there may be. Refusing would be an
+		 * error on the page. */
+		if (!c)
+			COMPLAIN("%d connections at once, one more waits\n", MAX_TCP);
+		else
+			COMPLAIN("no socket for a connection (error %d)\n", errno);
 		if (c)
 			tcp_free(c);
-		queue_tcp(nat, remote, rport, gport, 0, seq + 1, TH_RST | TH_ACK, NULL, 0);
 		return;
 	}
 	set_nonblocking(c->fd);
@@ -306,8 +324,11 @@ static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t 
 	c->rcv_nxt = seq + 1;
 	c->guest_window = window;
 	c->timer = now_ms();
-	if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) && errno != EINPROGRESS)
+	if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) && errno != EINPROGRESS) {
+		COMPLAIN("cannot connect to %u.%u.%u.%u:%u (error %d)\n", remote >> 24, remote >> 16 & 255,
+			 remote >> 8 & 255, remote & 255, rport, errno);
 		tcp_reset(nat, c);
+	}
 }
 
 /* A segment from the guest. */
@@ -414,6 +435,9 @@ static void tcp_host_event(struct nat *nat, struct tcp_conn *c, int revents)
 
 		if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &error, &len) || error ||
 		    (revents & (POLLERR | POLLHUP | POLLNVAL))) {
+			COMPLAIN("connection to %u.%u.%u.%u:%u failed (error %d, events %#x)\n",
+				 c->remote >> 24, c->remote >> 16 & 255, c->remote >> 8 & 255,
+				 c->remote & 255, c->rport, error, revents);
 			tcp_reset(nat, c);
 			return;
 		}
@@ -481,12 +505,16 @@ static struct udp_flow *udp_flow(struct nat *nat, uint16_t gport)
 			oldest = &nat->udp[i];
 	}
 	if (!f) {
+		if (now_ms() - oldest->used < 5000)
+			COMPLAIN("%d UDP exchanges at once, the oldest is dropped\n", MAX_UDP);
 		f = oldest;
 		close(f->fd);
 	}
 	f->fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (f->fd < 0)
+	if (f->fd < 0) {
+		COMPLAIN("no socket for UDP (error %d)\n", errno);
 		return NULL;
+	}
 	set_nonblocking(f->fd);
 	f->gport = gport;
 	return f;

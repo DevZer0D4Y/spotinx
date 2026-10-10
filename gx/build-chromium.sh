@@ -30,7 +30,7 @@ CHROMIUM=/usr/lib/chromium/chromium-headless-shell
 FULL_FLAGS="--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile \
 --no-first-run --no-default-browser-check --disable-breakpad --disable-crashpad-for-testing --test-type \
 --password-store=basic --disable-background-networking --disable-component-update \
---disk-cache-size=33554432 --media-cache-size=33554432"
+--disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic"
 # Where its address bar is, for gx (-A).
 FULL_ADDRESS=225,46,1150,80
 
