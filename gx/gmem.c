@@ -7,6 +7,15 @@
  * `svc #0` instructions patched as they are mapped, which is what lets ld.so
  * and dlopen() load libraries we never saw.
  *
+ * Anonymous memory that is not code ("data": heaps, stacks) is always readable
+ * and writable for the host, whatever protection the guest gives it, and is
+ * committed 256 KB at a time when the guest commits pieces of a reservation.
+ * The guest cannot tell: there are no signals here, so a protection it sets is
+ * only ever a fault it does not want. The host can: its kernel keeps a record
+ * per run of pages mapped alike, out of a store that runs out (Horizon stops
+ * serving the process at about ten thousand), and an allocator that commits
+ * its memory sixteen kilobytes at a time makes one run of each.
+ *
  * Shared file mappings (MAP_SHARED) are views of one copy of the file, made
  * of memory the host can map at several addresses. The copy is written back
  * to the file when its last view goes, so that a later mapping finds it. On
@@ -36,6 +45,8 @@
 #define VENEER_SIZE 32
 #define BRANCH_RANGE (128L << 20)
 #define MAX_IMAGES 1024
+#define DATA_UNIT (256UL << 10)   /* what data is committed by, inside reservations */
+#define DATA_PROT (GX_PROT_READ | GX_PROT_WRITE)
 #define MAX_SHARED 512
 #define MAX_VIEWS 4096
 #define MAX_CHUNKS 256
@@ -222,6 +233,61 @@ static int commit(uint64_t addr, uint64_t len, int prot)
 	return 0;
 }
 
+static struct image *image_of(uint64_t addr);
+
+/* Whether memory at addr, for a given protection, is data in the sense above:
+ * not code, and not part of a file's image (where a page is what its segment
+ * says). */
+static int is_data(uint64_t addr, int prot)
+{
+	return !(prot & GX_PROT_EXEC) && !image_of(addr);
+}
+
+/* Commits [addr, addr+len), reserved and not committed yet, as data the guest
+ * sees with prot. Whole units where a unit is all reservation, so that the
+ * pieces a guest commits one after the other are one mapping for the host. */
+static int commit_data(uint64_t addr, uint64_t len, int prot)
+{
+	uint64_t end = addr + len;
+
+	for (uint64_t unit = addr & ~(DATA_UNIT - 1); unit < end; unit += DATA_UNIT) {
+		uint64_t from = unit > addr ? unit : addr;
+		uint64_t to = unit + DATA_UNIT < end ? unit + DATA_UNIT : end;
+		int whole = in_arena(unit, DATA_UNIT);
+
+		for (uint64_t a = unit; whole && a < unit + DATA_UNIT; a += GX_PAGE)
+			whole = (page_state[page_of(a)] &
+				 (PG_USED | PG_COMMITTED | PG_SHARED | PG_COPY | PG_HOLE)) == PG_USED;
+		if (whole && !image_of(unit) && !image_of(unit + DATA_UNIT - 1)) {
+			if (host_commit((void *)unit, DATA_UNIT, DATA_PROT))
+				return -1;
+			/* All of it is there; the guest has what it asked for. */
+			memset(&page_state[page_of(unit)], PG_USED | PG_COMMITTED, DATA_UNIT / GX_PAGE);
+			count_committed(DATA_UNIT / GX_PAGE, page_of(unit) + DATA_UNIT / GX_PAGE);
+			continue;
+		}
+		/* A unit with something else in it: what is asked, no more, and
+		 * only what an earlier unit did not bring. */
+		for (uint64_t a = from; a < to;) {
+			uint64_t b = a;
+
+			if (page_state[page_of(a)] & PG_COMMITTED) {
+				a += GX_PAGE;
+				continue;
+			}
+			while (b < to && !(page_state[page_of(b)] & PG_COMMITTED))
+				b += GX_PAGE;
+			if (host_commit((void *)a, b - a, DATA_PROT))
+				return -1;
+			memset(&page_state[page_of(a)], PG_USED | PG_COMMITTED, (b - a) / GX_PAGE);
+			count_committed((b - a) / GX_PAGE, page_of(b));
+			a = b;
+		}
+	}
+	memset(&page_state[page_of(addr)], PG_USED | PG_COMMITTED | (prot & PG_PROT), len / GX_PAGE);
+	return 0;
+}
+
 static struct image *image_of(uint64_t addr)
 {
 	for (int i = 0; i < MAX_IMAGES; i++)
@@ -369,6 +435,15 @@ static void unmap_chunk(struct chunk *c, uint64_t base)
 		search_hint = page_of(base);
 }
 
+/* Where a mapping of a chunk goes. On a 2 MB boundary when the chunk is that
+ * large: the host's kernel can then map it in 2 MB pieces instead of pages,
+ * and its page tables are a resource that runs out (on Horizon, a few hundred
+ * mappings of 16 MB made of pages take them all, and the next one fails). */
+static uint64_t find_chunk_place(uint64_t size)
+{
+	return find_free_aligned(size / GX_PAGE, size >= (2UL << 20) ? 2UL << 20 : GX_PAGE);
+}
+
 /* Gets a chunk of the host's shared memory, mapped for ourselves. */
 static struct chunk *new_chunk(uint64_t size, int pooled)
 {
@@ -379,7 +454,7 @@ static struct chunk *new_chunk(uint64_t size, int pooled)
 			c = &chunks[i];
 	if (!c)
 		return NULL;
-	c->addr = find_free(size / GX_PAGE);
+	c->addr = find_chunk_place(size);
 	c->handle = c->addr ? host_shared_new(size) : -1;
 	if (c->handle < 0)
 		return NULL;
@@ -734,7 +809,7 @@ static long map_shared(uint64_t len, int prot, int fd, uint64_t off)
 		base = s->addr;
 		v->addr = base + off;
 	} else {
-		base = find_free(s->chunk->size / GX_PAGE);
+		base = find_chunk_place(s->chunk->size);
 		if (base && host_shared_map(s->chunk->handle, (void *)base, s->chunk->size, prot))
 			base = 0;
 		if (base)
@@ -790,8 +865,18 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 			return -GX_ENOMEM;
 	}
 
-	if (anonymous)
+	if (anonymous) {
+		/* Data is the host's to read and write whatever the guest says. */
+		if ((prot & PG_PROT) && is_data(addr, prot)) {
+			if (host_commit((void *)addr, size, DATA_PROT))
+				return -GX_ENOMEM;
+			count_committed(size / GX_PAGE, page_of(addr) + size / GX_PAGE);
+			memset(&page_state[page_of(addr)], PG_USED | PG_COMMITTED | (prot & PG_PROT),
+			       size / GX_PAGE);
+			return (long)addr;
+		}
 		return commit(addr, size, prot) ? -GX_ENOMEM : (long)addr;
+	}
 
 	if (commit(addr, size, GX_PROT_READ | GX_PROT_WRITE))
 		return -GX_ENOMEM;
@@ -889,8 +974,14 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 		} else if (page_state[p] & PG_COPY) {
 			/* One protection cannot suit every view of the copy. */
 		} else if (!(page_state[p] & PG_COMMITTED)) {
-			if ((prot & PG_PROT) && commit(run_addr, (q - p) * GX_PAGE, prot))
+			if (!(prot & PG_PROT))
+				;   /* reserved it was, reserved it stays */
+			else if (is_data(run_addr, prot) ? commit_data(run_addr, (q - p) * GX_PAGE, prot)
+							 : commit(run_addr, (q - p) * GX_PAGE, prot))
 				ret = -GX_ENOMEM;
+		} else if (!(page_state[p] & (PG_SHARED | GX_PROT_EXEC)) && is_data(run_addr, prot)) {
+			/* Data: the protection is the guest's idea of it, no more. */
+			memset(&page_state[p], PG_USED | PG_COMMITTED | (prot & PG_PROT), q - p);
 		} else {
 			/* Dropping all access keeps the contents: the guest may restore it. */
 			if (host_protect((void *)run_addr, (q - p) * GX_PAGE, prot)) {
@@ -917,9 +1008,7 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 	if (advice != MADV_DONTNEED)
 		return 0;
 	/* Private anonymous memory reads as zeroes afterwards, and allocators
-	 * count on it: writable pages are cleared, and pages without any access
-	 * (how PartitionAlloc decommits) are given back, to come back zeroed
-	 * when access does. */
+	 * count on it. */
 	host_lock_acquire(lock);
 	for (uint64_t p = page_of(addr), end = p + size / GX_PAGE; p < end;) {
 		uint8_t state = page_state[p];
@@ -929,7 +1018,11 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 			q++;
 		if (!(state & PG_COMMITTED) || (state & (PG_SHARED | PG_COPY))) {
 			/* nothing there, or not private */
-		} else if (state & GX_PROT_WRITE) {
+		} else if ((state & GX_PROT_WRITE) ||
+			   (!(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0))) {
+			/* Cleared and kept, also what has no access (how
+			 * PartitionAlloc decommits): giving it back would cut the
+			 * host's mapping in pieces. */
 			memset(arena + p * GX_PAGE, 0, (q - p) * GX_PAGE);
 		} else if (!(state & PG_PROT)) {
 			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);

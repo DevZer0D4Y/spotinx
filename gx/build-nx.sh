@@ -89,7 +89,7 @@ CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256
 	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
 objs=
-for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/host_nx.c \
+for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/host_nx.c \
 	"$OUT"/gl_table.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
 	"$OUT"/lkl/utils.c "$OUT"/lkl/virtio.c "$OUT"/lkl/virtio_net.c "$OUT"/lkl/virtio_blk.c \
 	"$OUT"/lkl/net.c "$OUT"/lkl/fs.c; do
@@ -133,12 +133,16 @@ if [ -e "$PC_OUT/chromium.ext4" ]; then
 		# second the page itself gets (requestAnimationFrame): what gx
 		# shows in the corner is how many of them reach the screen.
 		A='data:text/html,<body%20style="margin:0;background:%23204080;color:white;font:80px%20sans-serif"><div%20id=d%20style="position:absolute;top:300px;width:300px;height:300px;background:linear-gradient(red,lime)"></div><p%20id=o%20style="margin:100px%20200px">...</p><script>t=0;n=0;l=0;function%20f(now){t+=6;n++;if(now-l>=1000){o.textContent=n+"%20frames/s%20in%20the%20page";n=0;l=now}d.style.left=(t%251000)+"px";requestAnimationFrame(f)}requestAnimationFrame(f)</script>'
-		echo "[Chromium: BROWSE, starting at wikipedia.org] $B https://www.wikipedia.org/"
-		echo "[Chromium: speed test] $B $A"
-		echo "[Chromium: speed test, frame rate limit off] $B --disable-frame-rate-limit --disable-gpu-vsync $A"
-		echo "[Chromium: BROWSE, starting at the test page] $B file:///usr/share/gx/page.html"
-		echo "[Chromium: SHOW the test page on screen] $C --screenshot=/tmp/shot.png --window-size=1280,720 --hide-scrollbars file:///usr/share/gx/page.html"
-		echo "[Chromium: SHOW wikipedia.org on screen] $C --screenshot=/tmp/shot.png --window-size=1280,720 --hide-scrollbars https://www.wikipedia.org/"
+		# The Chromium with a window, on gx's Wayland display: the real
+		# thing. The entries after it are the older way, pictures over the
+		# debugging pipe of the headless one.
+		W="-w @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless --ozone-platform=wayland"
+		echo "[Chromium WINDOW: google.com] $W https://www.google.com/"
+		echo "[Chromium WINDOW: wikipedia.org] $W https://www.wikipedia.org/"
+		echo "[Chromium WINDOW: speed test] $W $A"
+		echo "[Chromium WINDOW: the test page] $W file:///usr/share/gx/page.html"
+		echo "[Chromium (old way): wikipedia.org] $B https://www.wikipedia.org/"
+		echo "[Chromium (old way): speed test] $B $A"
 		echo "[Chromium: text only (DOM of the test page)] $C --dump-dom file:///usr/share/gx/page.html"
 	} >>"$DIST/gx/programs.txt"
 fi

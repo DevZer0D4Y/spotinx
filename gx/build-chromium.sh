@@ -56,6 +56,10 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 	echo "hosts: files dns" >"$ROOT/etc/nsswitch.conf"
 	echo "nameserver 10.0.2.3" >"$ROOT/etc/resolv.conf"
 	echo "0123456789abcdef0123456789abcdef" >"$ROOT/etc/machine-id"
+	# The key map gx's Wayland display hands out (wl.c), a standard one.
+	if command -v xkbcli >/dev/null; then
+		xkbcli compile-keymap --layout us >"$ROOT/usr/share/gx/keymap.xkb" || exit 1
+	fi
 	cat >"$ROOT/usr/share/gx/page.html" <<'EOF'
 <!doctype html><html><head><title>gx page</title>
 <style>body{background:#204080;color:#fff;font:40px sans-serif}

@@ -504,6 +504,19 @@ void host_frame(const uint8_t *jpeg, size_t len)
 	}
 }
 
+/* The on-screen keyboard: here it says what it was given to edit, and always
+ * answers the words of GX_TEXT. */
+int host_ask_text(char *text, size_t room)
+{
+	const char *answer = getenv("GX_TEXT");
+
+	fprintf(stderr, "gx: keyboard asked to edit \"%s\"\n", text);
+	if (!answer)
+		return 0;
+	snprintf(text, room, "%s", answer);
+	return 1;
+}
+
 /* The same for the window of a Chromium that has one (wl.c): the pixels as
  * they are, in files a viewer opens (PPM). Not all of them: they are large. */
 void host_present(const uint8_t *pixels, int width, int height, int stride)
@@ -604,6 +617,10 @@ int host_input(struct cdp_input *in)
 		queue[queued++].type = CDP_RELOAD;
 	} else if (!strcmp(action, "enter")) {
 		queue[queued++].type = CDP_ENTER;
+	} else if (!strcmp(action, "edit")) {
+		queue[queued++].type = CDP_KEYBOARD;
+	} else if (!strcmp(action, "backspace")) {
+		queue[queued++].type = CDP_BACKSPACE;
 	} else if (!strcmp(action, "quit")) {
 		queue[queued++].type = CDP_QUIT;
 	} else if (!strncmp(action, "nav ", 4) || !strncmp(action, "text ", 5)) {

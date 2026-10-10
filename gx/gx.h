@@ -121,6 +121,10 @@ long gx_do_syscall(struct gx_frame *frame);
 /* Says where every guest thread is: what a host shows when the guest seems
  * stuck. */
 void gx_report_threads(void);
+/* Says how the kernel's own memory is doing (its /proc/meminfo, in short):
+ * files of its memory filesystems and its network buffers all come out of
+ * what it was started with, and it panics when that is gone. */
+void gx_report_kernel_memory(void);
 extern int gx_trace;
 /* How many processors the guest is told about; to be called once the kernel
  * runs and its /sys is mounted, before the guest starts. One by default. */

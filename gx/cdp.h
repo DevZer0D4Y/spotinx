@@ -18,7 +18,9 @@ enum {
 	CDP_RELOAD,
 	CDP_NAVIGATE,     /* text: a URL */
 	CDP_TEXT,         /* text: typed into whatever has the focus */
+	CDP_KEYBOARD,     /* the user wants the on-screen keyboard, to edit what has the focus */
 	CDP_ENTER,
+	CDP_BACKSPACE,
 	CDP_QUIT,
 };
 

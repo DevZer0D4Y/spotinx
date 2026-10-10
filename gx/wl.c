@@ -21,6 +21,7 @@
 #include "wl.h"
 
 #define SOCKET_PATH "/run/wayland-0"
+#define KEYMAP_PATH "/usr/share/gx/keymap.xkb"
 #define MAX_OBJECTS 4096
 #define MAX_POOLS 64
 #define MAX_CALLBACKS 16
@@ -30,13 +31,15 @@ enum {
 	T_NONE, T_DISPLAY, T_REGISTRY, T_COMPOSITOR, T_SHM, T_POOL, T_BUFFER, T_SURFACE,
 	T_REGION, T_SEAT, T_TOUCH, T_POINTER, T_KEYBOARD, T_OUTPUT, T_SUBCOMPOSITOR,
 	T_SUBSURFACE, T_WM_BASE, T_POSITIONER, T_XDG_SURFACE, T_TOPLEVEL, T_POPUP,
+	T_DECORATION_MANAGER, T_DECORATION, T_DATA_MANAGER, T_DATA_SOURCE, T_DATA_DEVICE,
 };
 
 static const char *const type_names[] = {
 	"?", "wl_display", "wl_registry", "wl_compositor", "wl_shm", "wl_shm_pool", "wl_buffer",
 	"wl_surface", "wl_region", "wl_seat", "wl_touch", "wl_pointer", "wl_keyboard", "wl_output",
 	"wl_subcompositor", "wl_subsurface", "xdg_wm_base", "xdg_positioner", "xdg_surface",
-	"xdg_toplevel", "xdg_popup",
+	"xdg_toplevel", "xdg_popup", "zxdg_decoration_manager_v1", "zxdg_toplevel_decoration_v1",
+	"wl_data_device_manager", "wl_data_source", "wl_data_device",
 };
 
 /* What the registry announces; the name of a global is its place here + 1. */
@@ -51,6 +54,13 @@ static const struct {
 	{ "wl_output", 2, T_OUTPUT },
 	{ "wl_seat", 5, T_SEAT },
 	{ "xdg_wm_base", 2, T_WM_BASE },
+	/* So that we can say the window's frame is ours to draw, and the client
+	 * draws no title bar buttons: there is nothing to minimise to. */
+	{ "zxdg_decoration_manager_v1", 1, T_DECORATION_MANAGER },
+	/* The clipboard, of which we only read what the client copies: that is
+	 * how the text of a field gets to the on-screen keyboard to be edited
+	 * (see edit_step()). */
+	{ "wl_data_device_manager", 3, T_DATA_MANAGER },
 };
 
 struct object {
@@ -73,10 +83,20 @@ static struct pool pools[MAX_POOLS];
 static int client = -1;
 static uint32_t serial = 1;
 static uint32_t main_surface, output_id, touch_id, pointer_id, pointer_inside;
+static uint32_t keyboard_id, keyboard_inside;
+static int has_keymap;
+/* The client's clipboard: the wl_data_source it last set as the selection,
+ * the kind of text it offers (0: none), and a count of the times it changed. */
+static uint32_t selection, selection_changes;
+static char selection_mime[48];
+/* The kind of text each of the last few data sources offers, by id. */
+static char source_mime[8][48];
+static uint32_t source_mime_id[8];
 static uint32_t callbacks[MAX_CALLBACKS];
 static int callback_count;
 static uint64_t last_frame;
-static int frames;
+static int frames, counted;
+static uint64_t count_since, present_ns;
 
 /* The kernel's socket structures, which LKL's headers do not have. */
 struct wl_msghdr {
@@ -189,15 +209,33 @@ static void show(struct object *surface, uint32_t surface_id)
 		memory = gmem_shared_peek(pools[buffer->pool].fd, &size);
 		if (memory && buffer->width > 0 && buffer->height > 0 && buffer->offset >= 0 &&
 		    (uint64_t)buffer->offset + (uint64_t)buffer->stride * buffer->height <= size) {
+			uint64_t start = host_now_ns(), took;
+
 			host_present(memory + buffer->offset, buffer->width, buffer->height, buffer->stride);
+			took = host_now_ns() - start;
 			if (!frames++ || gx_trace)
 				host_log("gx: wayland: picture %d, %dx%d\n", frames, buffer->width,
 					 buffer->height);
+			/* How smooth it is, every five seconds something was shown. */
+			if (!count_since)
+				count_since = start;
+			counted++;
+			present_ns += took;
+			if (start - count_since >= 5000000000ULL) {
+				host_log("gx: wayland: %d pictures in %lu ms, %lu ms each to show\n", counted,
+					 (unsigned long)((start - count_since) / 1000000),
+					 (unsigned long)(present_ns / counted / 1000000));
+				count_since = start;
+				counted = 0;
+				present_ns = 0;
+			}
 		}
 	}
 	/* We keep nothing of it: the client may draw in it again. */
 	event(surface->pending, 0, "");   /* wl_buffer.release */
 }
+
+static void keyboard_focus(void);
 
 static void commit(uint32_t id)
 {
@@ -213,6 +251,7 @@ static void commit(uint32_t id)
 		event(surface->xdg, 0, "u", serial++);   /* xdg_surface.configure */
 		if (output_id)
 			event(id, 0, "u", output_id);    /* wl_surface.enter */
+		keyboard_focus();
 	}
 	if (surface->attached) {
 		surface->attached = 0;
@@ -220,6 +259,37 @@ static void commit(uint32_t id)
 			show(surface, id);
 		surface->pending = 0;
 	}
+}
+
+/* Sends what is queued, the last event of which carries a file descriptor
+ * (it is not in the event's words: it travels beside them). */
+static void flush_with_fd(int fd)
+{
+	struct wl_iovec iov = { out, out_len };
+	struct wl_cmsg control = { 16 + 4, 1 /* SOL_SOCKET */, 1 /* SCM_RIGHTS */, { fd } };
+	struct wl_msghdr msg = { NULL, 0, &iov, 1, &control, 24, 0 };
+	long params[6] = { client, (long)&msg, 0 };
+
+	if (client >= 0 && out_len)
+		lkl_syscall(__lkl__NR_sendmsg, params);
+	out_len = 0;
+}
+
+/* The window has the keyboard as soon as there are both: Chromium only takes
+ * keys for a window that has it. */
+static void keyboard_focus(void)
+{
+	static const uint32_t none[1];
+
+	if (!keyboard_id || !main_surface || keyboard_inside)
+		return;
+	keyboard_inside = 1;
+	/* enter, then "modifiers" as a real keyboard would send, unless there
+	 * is no key map: Chromium then has no keyboard state to put them in,
+	 * and crashes on it. */
+	event(keyboard_id, 1, "uua", serial++, main_surface, none, 0);
+	if (has_keymap)
+		event(keyboard_id, 4, "uuuuu", serial++, 0, 0, 0, 0);
 }
 
 /* Tells the client it may draw the next frame, at the pace of the screen. */
@@ -258,6 +328,8 @@ static void bind_global(const uint32_t *w)
 
 	if (!name || name > sizeof(globals) / sizeof(globals[0]))
 		return;
+	if (gx_trace)
+		host_log("gx: wayland: bound %s version %u as %u\n", globals[name - 1].interface, version, id);
 	o = create(id, globals[name - 1].type, version);
 	switch (o->type) {
 	case T_SHM:
@@ -265,7 +337,7 @@ static void bind_global(const uint32_t *w)
 		event(id, 0, "u", 1);   /* XRGB8888 */
 		break;
 	case T_SEAT:
-		event(id, 0, "u", 1 | 4);   /* a pointer and a touch screen */
+		event(id, 0, "u", 1 | 2 | 4);   /* a pointer, a keyboard and a touch screen */
 		if (version >= 2)
 			event(id, 1, "s", "seat0");
 		break;
@@ -373,7 +445,30 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 			pointer_id = w[0];
 			pointer_inside = 0;
 		} else if (opcode == 1) {
+			/* The key map is a file of the guest's (a standard one,
+			 * put there when its root was made); without it, a key
+			 * map of format 0, "none", and no keys. */
+			int map = lkl_sys_open(KEYMAP_PATH, LKL_O_RDONLY, 0);
+			struct lkl_stat st;
+
 			create(w[0], T_KEYBOARD, o->version);
+			keyboard_id = w[0];
+			keyboard_inside = 0;
+			has_keymap = map >= 0 && !lkl_sys_fstat(map, &st) && st.st_size > 0;
+			if (!has_keymap) {
+				if (map >= 0)
+					lkl_sys_close(map);
+				map = lkl_sys_open("/dev/null", LKL_O_RDONLY, 0);
+			}
+			if (map >= 0) {
+				flush();
+				event(w[0], 0, "uu", has_keymap ? 1 : 0, has_keymap ? (uint32_t)st.st_size : 0);
+				flush_with_fd(map);
+				lkl_sys_close(map);
+			}
+			if (has_keymap && o->version >= 4)
+				event(w[0], 5, "ii", 0, 0);   /* repeat_info: we do the repeating */
+			keyboard_focus();
 		} else if (opcode == 2) {
 			create(w[0], T_TOUCH, o->version);
 			touch_id = w[0];
@@ -411,6 +506,8 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 				touch_id = 0;
 			if (id == pointer_id)
 				pointer_id = 0;
+			if (id == keyboard_id)
+				keyboard_id = 0;
 			delete_id(id);
 		}
 		break;
@@ -426,10 +523,125 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		if (opcode == 0)
 			delete_id(id);
 		break;
+	case T_DATA_MANAGER:
+		create(w[0], opcode == 0 ? T_DATA_SOURCE : T_DATA_DEVICE, o->version);
+		break;
+	case T_DATA_SOURCE:
+		if (opcode == 0) {            /* offer: a kind of data it can give */
+			const char *mime = (const char *)&w[1];
+
+			/* The first kind of plain text is the one we will ask for. */
+			if (!o->attached && !strncmp(mime, "text/plain", 10) &&
+			    w[0] <= sizeof(source_mime[0])) {
+				o->attached = 1;
+				memcpy(source_mime[id % 8], mime, w[0]);
+				source_mime_id[id % 8] = id;
+			}
+		} else if (opcode == 1) {
+			if (id == selection)
+				selection = 0;
+			delete_id(id);
+		}
+		break;
+	case T_DATA_DEVICE:
+		if (opcode == 1) {            /* set_selection: something was copied */
+			if (selection && selection != w[0] && selection < MAX_OBJECTS &&
+			    objects[selection].type == T_DATA_SOURCE)
+				event(selection, 2, "");   /* cancelled */
+			selection = w[0];
+			selection_mime[0] = 0;
+			if (selection && source_mime_id[selection % 8] == selection)
+				strcpy(selection_mime, source_mime[selection % 8]);
+			selection_changes++;
+		} else if (opcode == 2) {
+			delete_id(id);
+		}
+		break;
+	case T_DECORATION_MANAGER:
+		if (opcode == 0) {
+			delete_id(id);
+		} else if (opcode == 1) {     /* get_toplevel_decoration */
+			struct object *toplevel = w[1] < MAX_OBJECTS ? &objects[w[1]] : &objects[0];
+
+			create(w[0], T_DECORATION, 1)->surface = toplevel->surface;
+			event(w[0], 0, "u", 2);   /* configure: the server's side */
+			if (toplevel->surface < MAX_OBJECTS && objects[toplevel->surface].configured)
+				event(objects[toplevel->surface].xdg, 0, "u", serial++);
+		}
+		break;
+	case T_DECORATION:
+		if (opcode == 0) {
+			delete_id(id);
+		} else {                      /* set_mode, unset_mode: ours all the same */
+			event(id, 0, "u", 2);
+			if (o->surface < MAX_OBJECTS && objects[o->surface].configured)
+				event(objects[o->surface].xdg, 0, "u", serial++);
+		}
+		break;
 	}
 }
 
 /* ---------- what the user does ---------- */
+
+static void edit_start(void);
+
+/*
+ * Text reaches the client as the keys of a keyboard, because chromium-shell
+ * takes it no other way: it replaces its input method with a dummy, so the
+ * text-input protocols an on-screen keyboard would use go unanswered. The key
+ * map we hand out is the standard US one, which is what turns these numbers
+ * (Linux's own for each key) back into characters. Characters that keyboard
+ * does not have are dropped.
+ */
+static void press_key(uint32_t key, int shift, uint32_t ms)
+{
+	if (!keyboard_id || !keyboard_inside || !has_keymap)
+		return;
+	if (shift) {
+		event(keyboard_id, 3, "uuuu", serial++, ms, 42, 1);     /* left shift */
+		event(keyboard_id, 4, "uuuuu", serial++, 1, 0, 0, 0);   /* modifiers */
+	}
+	event(keyboard_id, 3, "uuuu", serial++, ms, key, 1);
+	event(keyboard_id, 3, "uuuu", serial++, ms, key, 0);
+	if (shift) {
+		event(keyboard_id, 3, "uuuu", serial++, ms, 42, 0);
+		event(keyboard_id, 4, "uuuuu", serial++, 0, 0, 0, 0);
+	}
+}
+
+/* A key with Control held. */
+static void press_control(uint32_t key, uint32_t ms)
+{
+	if (!keyboard_id || !keyboard_inside || !has_keymap)
+		return;
+	event(keyboard_id, 3, "uuuu", serial++, ms, 29, 1);     /* left control */
+	event(keyboard_id, 4, "uuuuu", serial++, 4, 0, 0, 0);
+	event(keyboard_id, 3, "uuuu", serial++, ms, key, 1);
+	event(keyboard_id, 3, "uuuu", serial++, ms, key, 0);
+	event(keyboard_id, 3, "uuuu", serial++, ms, 29, 0);
+	event(keyboard_id, 4, "uuuuu", serial++, 0, 0, 0, 0);
+}
+
+static void type_text(const char *text, uint32_t ms)
+{
+	/* The keys of a US keyboard, by the character each gives alone and
+	 * with shift, in the order of their numbers from 2 on. */
+	static const char plain[] = "1234567890-=\b\tqwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./";
+	static const char shifted[] = "!@#$%^&*()_+\0\0QWERTYUIOP{}\0\0ASDFGHJKL:\"~\0|ZXCVBNM<>?";
+
+	for (; *text; text++) {
+		if (*text == ' ') {
+			press_key(57, 0, ms);
+			continue;
+		}
+		for (int i = 0; i < (int)sizeof(plain) - 1; i++) {
+			if (plain[i] == *text || shifted[i] == *text) {
+				press_key(2 + i, plain[i] != *text, ms);
+				break;
+			}
+		}
+	}
+}
 
 static void input(const struct cdp_input *in, uint32_t ms)
 {
@@ -466,10 +678,117 @@ static void input(const struct cdp_input *in, uint32_t ms)
 				event(pointer_id, 5, "");                /* frame */
 		}
 		break;
+	case CDP_TEXT:
+		type_text(in->text, ms);
+		break;
+	case CDP_KEYBOARD:
+		edit_start();
+		break;
+	case CDP_ENTER:
+		press_key(28, 0, ms);
+		break;
+	case CDP_BACKSPACE:
+		press_key(14, 0, ms);
+		break;
 	case CDP_QUIT:
-		if (gx_trace)
+		if (gx_trace) {
 			gmem_report();
+			gx_report_kernel_memory();
+		}
 		host_exit(0);
+	}
+}
+
+/*
+ * Editing the text of a field with the on-screen keyboard. The keyboard has
+ * to start from what the field holds, and nothing tells us what that is; but
+ * the client will say if asked the way a user would: select everything (so
+ * that what is typed afterwards replaces it), copy, and the text is on the
+ * clipboard, which is ours to read. A field that is empty, or that does not
+ * let itself be copied (a password), simply gives nothing to start from.
+ */
+enum { EDIT_IDLE, EDIT_COPYING, EDIT_READING };
+#define EDIT_COPY_NS 250000000ULL   /* a copy takes 45 ms under qemu */
+
+static int edit_state, edit_pipe = -1;
+static uint64_t edit_since;
+static uint32_t edit_changes;
+static struct cdp_input edited;
+static size_t edited_len;
+
+static void edit_start(void)
+{
+	uint32_t ms = (uint32_t)(host_now_ns() / 1000000);
+
+	if (edit_state != EDIT_IDLE)
+		return;
+	edit_state = EDIT_COPYING;
+	edit_since = host_now_ns();
+	edit_changes = selection_changes;
+	edited_len = 0;
+	press_control(30, ms);   /* A: select all */
+	press_control(46, ms);   /* C: copy */
+}
+
+/* The text is known (or there is none): over to the user. */
+static void edit_finish(void)
+{
+	if (edit_pipe >= 0)
+		lkl_sys_close(edit_pipe);
+	edit_pipe = -1;
+	edit_state = EDIT_IDLE;
+	edited.text[edited_len] = 0;
+	flush();
+	if (host_ask_text(edited.text, sizeof(edited.text)))
+		type_text(edited.text, (uint32_t)(host_now_ns() / 1000000));
+}
+
+static void edit_step(uint64_t now)
+{
+	/* The caller's clock may be from just before the edit started. */
+	if (now < edit_since)
+		now = edit_since;
+	if (edit_state == EDIT_COPYING) {
+		int ends[2];
+
+		if (selection_changes == edit_changes) {
+			/* Nothing was copied, as far as we can wait to tell: an
+			 * empty field gives no sign, and the user is waiting. */
+			if (now - edit_since > EDIT_COPY_NS)
+				edit_finish();
+			return;
+		}
+		if (gx_trace)
+			host_log("gx: wayland: copied after %lu ms\n",
+				 (unsigned long)((now - edit_since) / 1000000));
+		if (!selection || !selection_mime[0] || lkl_sys_pipe(ends)) {
+			edit_finish();
+			return;
+		}
+		/* wl_data_source.send: write it there, please. */
+		flush();
+		event(selection, 1, "s", selection_mime);
+		flush_with_fd(ends[1]);
+		lkl_sys_close(ends[1]);
+		edit_pipe = ends[0];
+		edit_state = EDIT_READING;
+		edit_since = now;
+	} else if (edit_state == EDIT_READING) {
+		struct lkl_pollfd pfd = { .fd = edit_pipe, .events = LKL_POLLIN };
+
+		while (lkl_sys_poll(&pfd, 1, 0) > 0) {
+			long n = lkl_sys_read(edit_pipe, edited.text + edited_len,
+					      sizeof(edited.text) - 1 - edited_len);
+
+			if (n <= 0 || edited_len + n >= sizeof(edited.text) - 1) {
+				edited_len += n > 0 ? n : 0;
+				edit_finish();
+				return;
+			}
+			edited_len += n;
+		}
+		if (now - edit_since > 1500000000ULL)
+			edit_finish();
 	}
 }
 
@@ -543,6 +862,7 @@ static void wl_thread(void *arg)
 		now = host_now_ns();
 		while (host_input(&in))
 			input(&in, (uint32_t)(now / 1000000));
+		edit_step(now);
 		frame_tick(now);
 		flush();
 	}

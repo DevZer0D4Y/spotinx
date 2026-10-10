@@ -8,7 +8,8 @@
  *                          name in brackets if it starts with one. Before the
  *                          program: -t traces the guest's syscalls, -b gives
  *                          a headless Chromium the screen and the controls
- *                          (cdp.c; the keys are at host_input()), @<image>
+ *                          (cdp.c; the keys are at host_input()), -w is a
+ *                          Wayland display for one with a window (wl.c), @<image>
  *                          takes an ext4 image of sdmc:/gx as the root instead
  *                          of the sysroot, ><file> copies a guest file to
  *                          sdmc:/gx when the guest exits
@@ -49,9 +50,13 @@
 #include "gx.h"
 #include "nat.h"
 #include "cdp.h"
+#include "wl.h"
 
 #define GX_DIR "sdmc:/gx"
-#define KERNEL_ARGS "mem=192M loglevel=4"
+/* The kernel's memory holds every file that is not on the root image (its
+ * /tmp, a browser's profile and cache) and its network buffers: a browser on
+ * a busy site went through 192 MB and the kernel panicked. */
+#define KERNEL_ARGS "mem=512M loglevel=4"
 /* Left to malloc for stacks, libnx and the GPU driver; less when the homebrew
  * runs as an applet and the whole heap is a few hundred megabytes. */
 #define HEAP_KEPT (256UL << 20)
@@ -497,11 +502,26 @@ static int set_protection(size_t p, size_t n, int prot)
 	return 0;
 }
 
+/* The kernel's records of this process, as last counted (report_kernel_use()).
+ * Past about ten thousand, the kernel stops serving the process: it cannot
+ * even be told so, the calls to the SD card being the first to fail. Refusing
+ * memory before that at least ends in a message. */
+static volatile unsigned long kernel_blocks;
+#define KERNEL_BLOCKS_MAX 8500
+
 int host_commit(void *addr, size_t len, int prot)
 {
 	size_t first = page_of(addr), n = len / GX_PAGE, done = 0;
 	int ret = 0;
 
+	if (kernel_blocks > KERNEL_BLOCKS_MAX) {
+		static int said;
+
+		if (!said++)
+			host_log("gx: the kernel is short of memory records (%lu): no more memory "
+				 "for the guest\n", kernel_blocks);
+		return -1;
+	}
 	mutexLock(&mem_lock);
 	if (n > pool_free) {
 		host_log("gx: out of guest memory (%lu KB asked, %lu KB left)\n",
@@ -1059,6 +1079,7 @@ static void populate_root(void)
  */
 static EGLDisplay screen_display;
 static EGLSurface screen_surface;
+static GLint screen_blue_first;
 static int screen_ready;
 
 static int screen_open(void)
@@ -1066,9 +1087,10 @@ static int screen_open(void)
 	static const char vertex_source[] =
 		"attribute vec2 p; varying vec2 t;\n"
 		"void main() { t = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = vec4(p, 0.0, 1.0); }\n";
+	/* b is 1 for pixels that come blue first (a Wayland client's). */
 	static const char fragment_source[] =
-		"precision mediump float; uniform sampler2D s; varying vec2 t;\n"
-		"void main() { gl_FragColor = texture2D(s, t); }\n";
+		"precision mediump float; uniform sampler2D s; uniform float b; varying vec2 t;\n"
+		"void main() { vec4 c = texture2D(s, t); gl_FragColor = vec4(mix(c.rgb, c.bgr, b), 1.0); }\n";
 	static const GLfloat corners[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	static const EGLint config_attribs[] = {
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
@@ -1108,6 +1130,7 @@ static int screen_open(void)
 	glBindAttribLocation(program, 0, "p");
 	glLinkProgram(program);
 	glUseProgram(program);
+	screen_blue_first = glGetUniformLocation(program, "b");
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1121,13 +1144,14 @@ static int screen_open(void)
 	return 0;
 }
 
-/* Shows RGBA pixels; twice when the picture is to stay (there are two
- * buffers, and the screen shows either). */
-static void screen_show(const u8 *pixels, int width, int height, int passes)
+/* Shows pixels of four bytes, red first or blue first; twice when the picture
+ * is to stay (there are two buffers, and the screen shows either). */
+static void screen_show(const u8 *pixels, int width, int height, int blue_first, int passes)
 {
 	if (!screen_ready && screen_open())
 		return;
 	screen_ready = 1;
+	glUniform1f(screen_blue_first, blue_first ? 1.0f : 0.0f);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 	for (int pass = 0; pass < passes; pass++) {
 		glClearColor(0, 0, 0, 1);
@@ -1156,7 +1180,7 @@ static void show_picture(const char *path)
 	}
 	host_log("gx: showing %s (%ux%u); the rest is in the log\n", path, image.width, image.height);
 	sync_log();
-	screen_show(pixels, image.width, image.height, 2);
+	screen_show(pixels, image.width, image.height, 0, 2);
 	host_log("gx: shown (GL error %#x)\n", glGetError());
 	free(pixels);
 }
@@ -1218,13 +1242,37 @@ void host_frame(const uint8_t *jpeg, size_t len)
 	if (!frames++)
 		host_log("gx: first picture of the page (%dx%d); the rest is in the log\n", width, height);
 	draw_number(pixels, width, height, cdp_frames_per_second);
-	screen_show(pixels, width, height, 1);
+	screen_show(pixels, width, height, 0, 1);
+}
+
+/* The window of a Chromium that has one (wl.c): its pixels as they are. */
+void host_present(const uint8_t *pixels, int width, int height, int stride)
+{
+	static u8 *packed;
+	static int room;
+
+	if (stride != width * 4) {
+		/* GLES 2 takes rows that follow each other. */
+		if (width * height * 4 > room) {
+			free(packed);
+			room = width * height * 4;
+			packed = malloc(room);
+		}
+		if (!packed)
+			return;
+		for (int y = 0; y < height; y++)
+			memcpy(packed + (size_t)y * width * 4, pixels + (size_t)y * stride, width * 4);
+		pixels = packed;
+	}
+	screen_show(pixels, width, height, 1, 1);
 }
 
 /*
  * The user: a finger on the screen is a finger on the page; the sticks and
- * the d-pad scroll; B goes back, X reloads, Y asks for an address, A for text
- * to type where the focus is, and R is the Enter key. (+ quits, in main().)
+ * the d-pad scroll; A brings up the keyboard to edit what has the focus, R is
+ * the Enter key and L the Backspace key. With the headless Chromium (cdp.c), B
+ * goes back, X reloads and Y asks for an address; the one with a window
+ * (wl.c) has buttons of its own for those. (+ quits, in main().)
  */
 static int ask_text(const char *guide, const char *initial, char *out, size_t room)
 {
@@ -1240,6 +1288,16 @@ static int ask_text(const char *guide, const char *initial, char *out, size_t ro
 	rc = swkbdShow(&keyboard, out, room);
 	swkbdClose(&keyboard);
 	return R_SUCCEEDED(rc) && out[0];
+}
+
+static int wayland;   /* -w: the program wants a Wayland display (wl.c) */
+
+int host_ask_text(char *text, size_t room)
+{
+	char initial[512];
+
+	snprintf(initial, sizeof(initial), "%s", text);
+	return ask_text("Text", initial, text, room);
 }
 
 int host_input(struct cdp_input *in)
@@ -1287,6 +1345,13 @@ int host_input(struct cdp_input *in)
 		in->type = CDP_RELOAD;
 	} else if (down & HidNpadButton_R) {
 		in->type = CDP_ENTER;
+	} else if (down & HidNpadButton_L) {
+		in->type = CDP_BACKSPACE;
+	} else if (wayland && (down & HidNpadButton_A)) {
+		/* wl.c finds out what there is to edit, then asks for the text. */
+		in->type = CDP_KEYBOARD;
+	} else if (wayland && (down & (HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y))) {
+		/* Nothing: the window has buttons of its own for those. */
 	} else if (down & HidNpadButton_Y) {
 		if (ask_text("Address", "https://", in->text, sizeof(in->text)))
 			in->type = CDP_NAVIGATE;
@@ -1426,7 +1491,7 @@ static int import_tree(const char *host, const char *guest)
 
 /* ---------- the menu and the run ---------- */
 
-#define MAX_COMMANDS 16
+#define MAX_COMMANDS 24
 #define MAX_ARGS 32
 
 static char commands[MAX_COMMANDS][1024];
@@ -1493,10 +1558,17 @@ static int menu(PadState *pad)
 	return -1;
 }
 
+static void kernel_print(const char *str, int len)
+{
+	host_console_write(2, str, len);
+}
+
 static void run(void *arg)
 {
 	static char *guest_env[] = {
-		"PATH=/bin:/usr/bin", "HOME=/root", "LD_LIBRARY_PATH=/lib", "TMPDIR=/tmp", NULL,
+		"PATH=/bin:/usr/bin", "HOME=/root", "LD_LIBRARY_PATH=/lib", "TMPDIR=/tmp",
+		/* Where wl.c is, for the programs that look for a display. */
+		"XDG_RUNTIME_DIR=/run", "WAYLAND_DISPLAY=wayland-0", NULL,
 	};
 	struct __lkl__kernel_timespec now = { .tv_sec = time(NULL) };
 	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
@@ -1505,6 +1577,11 @@ static void run(void *arg)
 	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
 	/* Where LKL's virtio devices tell the kernel they exist. */
 	lkl_host_ops.virtio_devices = lkl_virtio_devs;
+	/* The kernel's messages go where ours do. The function nx_host.c has
+	 * for them writes to the console whether there is one or not, and the
+	 * console's memory is gone once a program has the screen: a kernel
+	 * warning in the middle of a web page then stopped everything. */
+	lkl_host_ops.print = kernel_print;
 	ret = lkl_init(&lkl_host_ops);
 	if (!ret)
 		net_id = net_add();
@@ -1576,6 +1653,8 @@ static void run(void *arg)
 		host_log("gx: cannot set up the guest address space\n");
 		host_exit(1);
 	}
+	if (wayland && wl_start())
+		host_log("gx: cannot open the Wayland display\n");
 	if (browser && cdp_start())
 		host_log("gx: cannot set up the pipe to Chromium\n");
 	host_log("gx: running %s\n\n", guest_argv[0]);
@@ -1613,6 +1692,7 @@ static void report_kernel_use(void)
 	}
 	for (int i = 0; i < MAX_SHARED_HANDLES; i++)
 		handles += shared_handles[i] != 0;
+	kernel_blocks = blocks;
 	host_log("gx: kernel memory blocks: %lu (%lu guest, %lu shared, %lu heap); "
 		 "%d shared objects; %lu MB of the pool free\n",
 		 (unsigned long)blocks, (unsigned long)code, (unsigned long)shared,
@@ -1629,6 +1709,7 @@ static void watchdog(void *arg)
 			break;
 		host_log("gx: after %d s\n", seconds);
 		report_kernel_use();
+		gx_report_kernel_memory();
 		gx_report_threads();
 		sync_log();
 	}
@@ -1676,6 +1757,8 @@ int main(int argc, char **argv)
 			gx_trace = 1;
 		else if (!guest_argc && !strcmp(word, "-b"))
 			browser = 1;
+		else if (!guest_argc && !strcmp(word, "-w"))
+			wayland = 1;
 		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2])
 			cpu_count = atoi(word + 2);
 		else if (!guest_argc && word[0] == '@')

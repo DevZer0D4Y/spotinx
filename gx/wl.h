@@ -5,6 +5,7 @@
 #ifndef GX_WL_H
 #define GX_WL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define WL_SCREEN_WIDTH 1280
@@ -18,6 +19,11 @@ int wl_start(void);
 
 /* What the host provides, called from the one thread of wl.c, together with
  * host_input() of cdp.h for what the user does. */
+
+/* The user wants to type: text holds what the field has now, and gets what it
+ * should have instead. Returns 0 if the user gave up. May take as long as
+ * the user does. */
+int host_ask_text(char *text, size_t room);
 
 /* The window's picture: rows of stride bytes, four per pixel in the order
  * blue, green, red, unused. Valid until the call returns. */

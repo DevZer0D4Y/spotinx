@@ -434,8 +434,10 @@ static long dispatch(struct gx_frame *f, struct gx_thread *self)
 	case 98:  return do_futex(f, self);
 	case 93:  do_exit_thread(self, (int)f->x[0]); return 0;
 	case 94:
-		if (gx_trace)
+		if (gx_trace) {
 			gmem_report();
+			gx_report_kernel_memory();
+		}
 		host_exit((int)f->x[0]);
 		return 0;
 	case 96:  self->clear_tid = (int *)f->x[0]; return self->tid;
@@ -612,6 +614,58 @@ static void report_thread(struct gx_thread *t, uint64_t elapsed)
 	else
 		host_log("syscall %ld(%#lx, %#lx, %#lx)\n", nr, (unsigned long)t->args[0],
 			 (unsigned long)t->args[1], (unsigned long)t->args[2]);
+}
+
+void gx_report_kernel_memory(void)
+{
+	static const char *const wanted[] = { "MemTotal", "MemFree", "Cached", "Unevictable", "Slab" };
+	char text[2048], line[160] = "gx: kernel memory:";
+	int fd = lkl_sys_open("/proc/meminfo", LKL_O_RDONLY, 0);
+	long n = fd < 0 ? -1 : lkl_sys_read(fd, text, sizeof(text) - 1);
+
+	if (fd >= 0)
+		lkl_sys_close(fd);
+	if (n <= 0)
+		return;
+	text[n] = 0;
+	for (unsigned i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
+		const char *at = text;
+		size_t len = strlen(wanted[i]);
+
+		/* The line that starts with the name: "Cached:      1234 kB". */
+		while (at && (strncmp(at, wanted[i], len) || at[len] != ':')) {
+			at = strchr(at, '\n');
+			if (at)
+				at++;
+		}
+		if (at) {
+			long kb = 0;
+
+			for (at += len + 1; *at == ' '; at++)
+				;
+			for (; *at >= '0' && *at <= '9'; at++)
+				kb = kb * 10 + *at - '0';
+			if (strlen(line) < sizeof(line) - 40) {
+				char *end = line + strlen(line);
+				char digits[16];
+				int d = 0;
+
+				*end++ = ' ';
+				strcpy(end, wanted[i]);
+				end += len;
+				*end++ = ' ';
+				kb >>= 10;
+				do
+					digits[d++] = '0' + kb % 10;
+				while (kb /= 10);
+				while (d)
+					*end++ = digits[--d];
+				strcpy(end, " MB,");
+			}
+		}
+	}
+	line[strlen(line) - 1] = '\n';
+	host_log("%s", line);
 }
 
 void gx_report_threads(void)

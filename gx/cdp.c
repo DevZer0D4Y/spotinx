@@ -299,6 +299,14 @@ static void handle_input(const struct cdp_input *in)
 		command("Input.dispatchKeyEvent",
 			"{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13}");
 		break;
+	case CDP_BACKSPACE:
+		command("Input.dispatchKeyEvent",
+			"{\"type\":\"keyDown\",\"key\":\"Backspace\",\"code\":\"Backspace\","
+			"\"windowsVirtualKeyCode\":8}");
+		command("Input.dispatchKeyEvent",
+			"{\"type\":\"keyUp\",\"key\":\"Backspace\",\"code\":\"Backspace\","
+			"\"windowsVirtualKeyCode\":8}");
+		break;
 	case CDP_QUIT:
 		session[0] = 0;   /* a command of the browser, not of the page */
 		command("Browser.close", NULL);
