@@ -45,6 +45,7 @@
 #include <GLES2/gl2.h>
 #include <png.h>
 #include <turbojpeg.h>
+#include <zlib.h>
 #include <lkl.h>
 #include <lkl_host.h>
 #include "gx.h"
@@ -1432,36 +1433,111 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
 
 /* ---------- the root filesystem ---------- */
 
-/* An ext4 image on the SD card as a disk of the kernel: what a root too big
- * to copy into memory needs. Read-only. */
-static struct lkl_disk root_disk;
-static FILE *root_image;
-static Mutex root_lock;
+/* An ext4 image on the SD card as a disk of the kernel. The root is one, too
+ * big to copy into memory and only read; the profile is another, which is the
+ * guest's /root and is written: what a browser keeps from one run to the
+ * next. */
+struct image {
+	FILE *file;
+	Mutex lock;
+	int written;       /* since it was last committed to the card */
+};
+
+static struct image root_image, profile_image;
+static struct lkl_disk root_disk = { .handle = &root_image };
+static struct lkl_disk profile_disk = { .handle = &profile_image };
+static int profile_mounted;
 
 static int image_capacity(struct lkl_disk disk, unsigned long long *res)
 {
-	fseeko(root_image, 0, SEEK_END);
-	*res = ftello(root_image);
+	struct image *image = disk.handle;
+
+	mutexLock(&image->lock);
+	fseeko(image->file, 0, SEEK_END);
+	*res = ftello(image->file);
+	mutexUnlock(&image->lock);
 	return 0;
 }
 
 static int image_request(struct lkl_disk disk, struct lkl_blk_req *req)
 {
+	struct image *image = disk.handle;
 	int status = LKL_DEV_BLK_STATUS_OK;
 
-	if (req->type == LKL_DEV_BLK_TYPE_FLUSH || req->type == LKL_DEV_BLK_TYPE_FLUSH_OUT)
-		return LKL_DEV_BLK_STATUS_OK;
-	if (req->type != LKL_DEV_BLK_TYPE_READ)
+	if (req->type == LKL_DEV_BLK_TYPE_FLUSH || req->type == LKL_DEV_BLK_TYPE_FLUSH_OUT) {
+		/* The kernel wants what it wrote to be safe: on the card, not in
+		 * a buffer of ours. Its journal counts on it. */
+		mutexLock(&image->lock);
+		if (image->written) {
+			if (fflush(image->file) || fsync(fileno(image->file)))
+				status = LKL_DEV_BLK_STATUS_IOERR;
+			image->written = 0;
+		}
+		mutexUnlock(&image->lock);
+		return status;
+	}
+	if (req->type != LKL_DEV_BLK_TYPE_READ &&
+	    (req->type != LKL_DEV_BLK_TYPE_WRITE || image != &profile_image))
 		return LKL_DEV_BLK_STATUS_UNSUP;
-	mutexLock(&root_lock);
-	if (fseeko(root_image, req->sector * 512, SEEK_SET))
+	mutexLock(&image->lock);
+	if (fseeko(image->file, req->sector * 512, SEEK_SET))
 		status = LKL_DEV_BLK_STATUS_IOERR;
-	for (int i = 0; i < req->count && status == LKL_DEV_BLK_STATUS_OK; i++)
-		if (fread(req->buf[i].iov_base, 1, req->buf[i].iov_len, root_image) !=
-		    req->buf[i].iov_len)
+	for (int i = 0; i < req->count && status == LKL_DEV_BLK_STATUS_OK; i++) {
+		size_t len = req->buf[i].iov_len, done;
+
+		if (req->type == LKL_DEV_BLK_TYPE_READ) {
+			done = fread(req->buf[i].iov_base, 1, len, image->file);
+		} else {
+			done = fwrite(req->buf[i].iov_base, 1, len, image->file);
+			image->written = 1;
+		}
+		if (done != len)
 			status = LKL_DEV_BLK_STATUS_IOERR;
-	mutexUnlock(&root_lock);
+	}
+	mutexUnlock(&image->lock);
 	return status;
+}
+
+/* The profile, the first time: an empty filesystem cannot be made here, so one
+ * comes packed next to the program (it packs to nothing) and is unpacked. */
+static void unpack_profile(const char *path)
+{
+	static u8 buffer[1 << 20];
+	char packed[520];
+	gzFile in;
+	FILE *out;
+	int n, ok = 1;
+	long total = 0;
+
+	snprintf(packed, sizeof(packed), "%s.gz", path);
+	in = gzopen(packed, "rb");
+	if (!in)
+		return;
+	out = fopen(path, "wb");
+	host_log("gx: making %s, where the browser keeps what is to last (once, a moment)\n", path);
+	while (out && (n = gzread(in, buffer, sizeof(buffer))) > 0) {
+		if (fwrite(buffer, 1, n, out) != (size_t)n) {
+			ok = 0;
+			break;
+		}
+		total += n;
+	}
+	gzclose(in);
+	if (out && fclose(out))
+		ok = 0;
+	if (!out || !ok || !total) {
+		host_log("gx: could not make it (is the card full?)\n");
+		remove(path);
+	}
+}
+
+/* A browser leaves these in its profile to say it is running, and takes them
+ * away when it ends as it should; here it never does, it is ended. */
+static void unlock_profile(void)
+{
+	lkl_sys_unlink("/root/profile/SingletonLock");
+	lkl_sys_unlink("/root/profile/SingletonCookie");
+	lkl_sys_unlink("/root/profile/SingletonSocket");
 }
 
 /* Under the name LKL's disk code looks for its default operations. */
@@ -1491,7 +1567,8 @@ static void populate_root(void)
 	lkl_sys_mount("tmpfs", "/dev", "tmpfs", 0, NULL);
 	lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
 	lkl_sys_mount("tmpfs", "/run", "tmpfs", 0, NULL);
-	lkl_sys_mount("tmpfs", "/root", "tmpfs", 0, NULL);
+	if (!profile_mounted)
+		lkl_sys_mount("tmpfs", "/root", "tmpfs", 0, NULL);
 	lkl_sys_mkdir("/dev/shm", 01777);
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
 		lkl_sys_mknod(nodes[i].path, LKL_S_IFCHR | 0666, 1 << 8 | nodes[i].minor);
@@ -1941,7 +2018,8 @@ static int import_tree(const char *host, const char *guest)
 #define MAX_ARGS 32
 
 static char commands[MAX_COMMANDS][1024];
-static const char *root_image_name;   /* @<image>: an ext4 image of sdmc:/gx as the root */
+static const char *root_image_name;   /* @<image>: an ext4 image next to the program as the root */
+static const char *profile_name;      /* =<image>: one that is the guest's /root, and written */
 static int browser;                   /* -b: the program is a Chromium to drive (cdp.c) */
 static int cpu_count;                 /* -c<n>: processors the guest is told about */
 static int command_count;
@@ -2044,7 +2122,7 @@ static void run(void *arg)
 	};
 	struct __lkl__kernel_timespec now = { .tv_sec = time(NULL) };
 	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
-	int ret, net_id = -1, disk_id = -1;
+	int ret, net_id = -1, disk_id = -1, profile_id = -1;
 
 	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
 	/* Where LKL's virtio devices tell the kernel they exist. */
@@ -2063,16 +2141,32 @@ static void run(void *arg)
 		char path[512];
 
 		snprintf(path, sizeof(path), GX_DIR "/%s", root_image_name);
-		root_image = fopen(path, "rb");
-		if (root_image) {
+		root_image.file = fopen(path, "rb");
+		if (root_image.file) {
 			/* The SD card is slow by small pieces. */
-			setvbuf(root_image, NULL, _IOFBF, 1 << 20);
+			setvbuf(root_image.file, NULL, _IOFBF, 1 << 20);
 			disk_id = lkl_disk_add(&root_disk);
 		}
 		if (disk_id < 0) {
 			host_log("gx: cannot use %s as a disk (%d)\n", path, disk_id);
 			host_exit(1);
 		}
+	}
+	if (!ret && profile_name && disk_id >= 0) {
+		char path[512];
+
+		snprintf(path, sizeof(path), GX_DIR "/%s", profile_name);
+		profile_image.file = fopen(path, "r+b");
+		if (!profile_image.file) {
+			unpack_profile(path);
+			profile_image.file = fopen(path, "r+b");
+		}
+		if (profile_image.file) {
+			setvbuf(profile_image.file, NULL, _IOFBF, 1 << 16);
+			profile_id = lkl_disk_add(&profile_disk);
+		}
+		if (profile_id < 0)
+			host_log("gx: cannot use %s as a disk: nothing will be kept\n", path);
 	}
 	if (!ret)
 		ret = lkl_start_kernel(KERNEL_ARGS);
@@ -2101,6 +2195,25 @@ static void run(void *arg)
 			ret = lkl_sys_mkdir(mnt, 0755);
 		if (!ret)
 			ret = lkl_sys_mount((char *)node, (char *)mnt, "ext4", LKL_MS_RDONLY, NULL);
+		if (!ret && profile_id >= 0) {
+			/* Before the root is the root: its /root is where the
+			 * profile goes, and the device's name cannot be made on a
+			 * root that is read-only. */
+			static const char profile_node[] = "/gx-profile-disk";
+			long args[6] = { LKL_AT_FDCWD, (long)profile_node, LKL_S_IFBLK | 0600 };
+			int err = lkl_get_virtio_blkdev(profile_id, 0, &dev);
+
+			args[3] = dev;
+			if (!err)
+				err = lkl_syscall(__lkl__NR_mknodat, args);
+			if (!err)
+				err = lkl_sys_mount((char *)profile_node, "/gx-root/root", "ext4", 0, NULL);
+			if (err)
+				host_log("gx: cannot mount %s (%d): nothing will be kept\n", profile_name, err);
+			else
+				host_log("gx: what is to last is kept in %s\n", profile_name);
+			profile_mounted = !err;
+		}
 		if (!ret)
 			ret = lkl_sys_chroot(mnt);
 		if (!ret)
@@ -2116,6 +2229,8 @@ static void run(void *arg)
 			host_exit(1);
 	}
 	populate_root();
+	if (profile_mounted)
+		unlock_profile();
 	if (cpu_count)
 		gx_set_cpus(cpu_count);
 	/* Descriptors 0-2 are the console; keep the kernel from handing those
@@ -2241,7 +2356,7 @@ static void report_stuck(void)
 /* Asks the kernel how its memory is, when the watchdog says so: on a thread
  * of its own, since a kernel that has stopped never answers and whoever asks
  * waits with it. */
-static volatile int kernel_asked;
+static volatile int kernel_asked, leaving, left;
 
 static void kernel_probe(void *arg)
 {
@@ -2249,6 +2364,16 @@ static void kernel_probe(void *arg)
 		if (kernel_asked) {
 			gx_report_kernel_memory();
 			kernel_asked = 0;
+		}
+		if (leaving && !left) {
+			/* The user quits: what the kernel still has in memory of
+			 * the profile goes to its image first. Asked here because
+			 * the main thread cannot ask the kernel anything. */
+			long none[6] = { 0 };
+
+			if (profile_mounted)
+				lkl_syscall(__lkl__NR_sync, none);
+			left = 1;
 		}
 		svcSleepThread(100000000ULL);
 	}
@@ -2389,6 +2514,8 @@ int main(int argc, char **argv)
 			cpu_count = atoi(word + 2);
 		else if (!guest_argc && word[0] == '@')
 			root_image_name = word + 1;
+		else if (!guest_argc && word[0] == '=')
+			profile_name = word + 1;
 		else if (!guest_argc && word[0] == '>')
 			export_path = word + 1;
 		else
@@ -2426,10 +2553,15 @@ int main(int argc, char **argv)
 	}
 	/* Kernel and guest threads cannot be stopped one by one; ending the
 	 * process is the only clean way out (back to the HOME menu). */
+	leaving = 1;
+	for (int i = 0; i < 500 && profile_mounted && !left; i++)
+		svcSleepThread(10000000ULL);   /* five seconds at most: the kernel may be stuck */
 	for (int i = 0; i < 100 && !mutexTryLock(&print_lock); i++)
 		svcSleepThread(10000000ULL);   /* not for ever: its holder may be stuck */
 	if (log_file)
 		fclose(log_file);
+	if (profile_image.file && mutexTryLock(&profile_image.lock))
+		fclose(profile_image.file);
 	svcExitProcess();
 	return 0;
 }

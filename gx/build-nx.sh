@@ -183,7 +183,11 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 		S="-w -b @chromium.ext4 /usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland --enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
 		echo "[Chromium NX (chromium-shell, GPU)] $S" >"$APP/programs.txt"
 	fi
-	echo "[Chromium, the whole browser (trial, no GPU)] -w @chromium-full.ext4 $(cat "$PC_OUT/chromium-full.cmd") --disable-gpu --enable-spatial-navigation https://www.google.com/" >>"$APP/programs.txt"
+	# Its profile: an empty filesystem, packed, that the program unpacks
+	# next to itself the first time (profile.ext4, which is then the user's:
+	# nothing here replaces it).
+	[ ! -e "$PC_OUT/profile.ext4.gz" ] || cp "$PC_OUT/profile.ext4.gz" "$APP/profile.ext4.gz"
+	echo "[Chromium, the whole browser (trial, no GPU)] -w @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd") --disable-gpu --enable-spatial-navigation https://www.google.com/" >>"$APP/programs.txt"
 fi
 ls -la "$APP"
 echo "copy the contents of gx/dist-nx to the root of the SD card"

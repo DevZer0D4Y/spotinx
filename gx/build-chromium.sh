@@ -30,7 +30,7 @@ CHROMIUM=/usr/lib/chromium/chromium-headless-shell
 FULL_FLAGS="--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile \
 --no-first-run --no-default-browser-check --disable-breakpad --disable-crashpad-for-testing --test-type \
 --password-store=basic --disable-background-networking --disable-component-update \
---disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic"
+--disk-cache-size=33554432 --media-cache-size=33554432 --disable-quic --hide-crash-restore-bubble"
 # Where its address bar is, for gx (-A).
 FULL_ADDRESS=225,46,1150,80
 
@@ -147,6 +147,14 @@ EOF
 		mke2fs -q -t ext4 -O ^has_journal -d "$SLIM" "$OUT/chromium-full-switch.ext4" "${size}M" || exit 1
 		rm -rf "$SLIM"
 		echo "$OUT/chromium-full-switch.ext4: ${size} MB"
+		# Where it keeps what is to last from one run to the next, its
+		# profile: an empty filesystem that gx mounts on /root, read and
+		# written. With a journal, since the console is switched off
+		# without a word. Empty, it packs to nothing: the console unpacks
+		# it the first time.
+		rm -f "$OUT/profile.ext4" "$OUT/profile.ext4.gz"
+		mke2fs -q -t ext4 -L profile "$OUT/profile.ext4" 256M || exit 1
+		gzip -9 -k "$OUT/profile.ext4" || exit 1
 		# How to start it, for build-nx.sh to put in the console's menu.
 		echo "-A$FULL_ADDRESS /usr/lib/chromium/chromium $FULL_FLAGS" >"$OUT/chromium-full.cmd"
 	fi
@@ -161,7 +169,12 @@ if [ "${1:-}" = full ]; then
 	rm -rf "$OUT/chromium-frames"
 	mkdir -p "$OUT/chromium-frames"
 	export GX_FRAMES=$OUT/chromium-frames GX_INPUT=${GX_INPUT:-}
+	# Its profile is kept from one run here to the next; GX_FRESH=1 starts
+	# from an empty one.
+	[ -z "${GX_FRESH:-}" ] || rm -f "$OUT/profile-pc.ext4"
+	[ -e "$OUT/profile-pc.ext4" ] || cp "$OUT/profile.ext4" "$OUT/profile-pc.ext4" || exit 1
 	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -A $FULL_ADDRESS \
+		-p "$OUT/profile-pc.ext4" \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$OUT/chromium-full-switch.ext4" \
 		/usr/lib/chromium/chromium $FULL_FLAGS --disable-gpu ${GX_JS---js-flags=--jitless} \
 		"${@:-file:///usr/share/gx/page.html}"

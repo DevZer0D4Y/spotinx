@@ -188,9 +188,17 @@ uint64_t host_thread_cpu_ns(uint64_t thread)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+static int profile_mounted;
+
 void host_exit(int code)
 {
 	export_file();
+	if (profile_mounted) {
+		/* What is still in the kernel's memory goes to the image. */
+		long none[6] = { 0 };
+
+		lkl_syscall(__lkl__NR_sync, none);
+	}
 	fflush(NULL);
 	_exit(code);
 }
@@ -925,6 +933,20 @@ static int net_up(int id)
 /* ---------- the root filesystem ---------- */
 
 static struct lkl_disk root_disk;
+/* -p <image>: an ext4 image that is the guest's /root, where what a program
+ * keeps from one run to the next goes (a browser's profile). Read and
+ * written, unlike the root. */
+static struct lkl_disk profile_disk;
+static const char *profile_path;
+
+/* A browser leaves these in its profile to say it is running, and takes them
+ * away when it ends as it should; here it never does, it is ended. */
+static void unlock_profile(void)
+{
+	lkl_sys_unlink("/root/profile/SingletonLock");
+	lkl_sys_unlink("/root/profile/SingletonCookie");
+	lkl_sys_unlink("/root/profile/SingletonSocket");
+}
 
 /* What a program expects around its files, whatever the root is made of. The
  * mount points have to exist already when the root is a read-only image. */
@@ -947,7 +969,8 @@ static void populate_root(void)
 	lkl_sys_mount("tmpfs", "/dev", "tmpfs", 0, NULL);
 	lkl_sys_mount("tmpfs", "/tmp", "tmpfs", 0, NULL);
 	lkl_sys_mount("tmpfs", "/run", "tmpfs", 0, NULL);
-	lkl_sys_mount("tmpfs", "/root", "tmpfs", 0, NULL);
+	if (!profile_mounted)
+		lkl_sys_mount("tmpfs", "/root", "tmpfs", 0, NULL);
 	lkl_sys_mkdir("/dev/shm", 01777);
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
 		lkl_sys_mknod(nodes[i].path, LKL_S_IFCHR | 0666, 1 << 8 | nodes[i].minor);
@@ -961,7 +984,7 @@ int main(int argc, char **argv)
 	int env_count = 4;
 	struct sigaction sa = { 0 };
 	struct stat root;
-	int disk_id = -1;
+	int disk_id = -1, profile_id = -1;
 	int arg = 1, net = 0, net_id = -1, browser = 0, wayland = 0, cpu_count = 0, ret;
 
 	for (; arg < argc && argv[arg][0] == '-'; arg++) {
@@ -973,6 +996,8 @@ int main(int argc, char **argv)
 			browser = 1;
 		else if (!strcmp(argv[arg], "-w"))
 			wayland = 1;
+		else if (!strcmp(argv[arg], "-p") && arg + 1 < argc)
+			profile_path = argv[++arg];
 		else if (!strcmp(argv[arg], "-A") && arg + 1 < argc) {
 			int l, t, r, b;
 
@@ -1008,6 +1033,12 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+	if (!ret && profile_path) {
+		profile_disk.fd = open(profile_path, O_RDWR);
+		profile_id = profile_disk.fd < 0 ? -1 : lkl_disk_add(&profile_disk);
+		if (profile_id < 0)
+			fprintf(stderr, "gx: cannot use %s as a disk: nothing will be kept\n", profile_path);
+	}
 	if (!ret)
 		ret = lkl_start_kernel("mem=512M loglevel=0");
 	if (ret) {
@@ -1036,6 +1067,25 @@ int main(int argc, char **argv)
 		char mnt[64];
 
 		ret = lkl_mount_dev(disk_id, 0, "ext4", LKL_MS_RDONLY, NULL, mnt, sizeof(mnt));
+		if (!ret && profile_id >= 0) {
+			/* Before the root is the root: its /root is where the
+			 * profile goes, and the device's name cannot be made on a
+			 * root that is read-only. */
+			static const char node[] = "/gx-profile-disk";
+			char target[96];
+			uint32_t dev = 0;
+			int err = lkl_get_virtio_blkdev(profile_id, 0, &dev);
+
+			snprintf(target, sizeof(target), "%s/root", mnt);
+			if (!err)
+				err = lkl_sys_mknod(node, LKL_S_IFBLK | 0600, dev);
+			if (!err)
+				err = lkl_sys_mount((char *)node, target, "ext4", 0, NULL);
+			if (err)
+				fprintf(stderr, "gx: cannot mount %s (%s): nothing will be kept\n",
+					profile_path, lkl_strerror(err));
+			profile_mounted = !err;
+		}
 		if (!ret)
 			ret = lkl_sys_chroot(mnt);
 		if (!ret)
@@ -1048,6 +1098,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	populate_root();
+	if (profile_mounted)
+		unlock_profile();
 	if (cpu_count)
 		gx_set_cpus(cpu_count);
 	/* Descriptors 0-2 are the host console; keep the kernel from handing
