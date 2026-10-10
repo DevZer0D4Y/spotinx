@@ -408,11 +408,28 @@ static void gl_presented(void *dpy, void *screen)
 
 static const struct glwin_host gl_host = { gl_real, gl_screen, gl_presented };
 
-/* The guest's windows are glwin.c's: it puts them together on the screen. */
+/* The guest's windows are glwin.c's: it puts them together on the screen, and
+ * the surfaces the guest has for them are its names for that. */
 static void *gl_create_window_surface(void *dpy, void *config, void *window, const void *attribs)
 {
-	glwin_init(&gl_host);
 	return glwin_create(dpy, config, window);
+}
+
+static unsigned gl_make_current(void *dpy, void *draw, void *read, void *ctx)
+{
+	return glwin_make_current(dpy, draw, read, ctx) > 0;
+}
+
+static void *gl_get_current_surface(int32_t which)
+{
+	return glwin_current_surface(which);
+}
+
+static unsigned gl_surface_attrib(void *dpy, void *surface, int32_t attribute, int32_t value)
+{
+	unsigned (*set)(void *, void *, int32_t, int32_t) = gl_real("eglSurfaceAttrib");
+
+	return set(dpy, glwin_surface(surface), attribute, value);
 }
 
 static unsigned gl_destroy_surface(void *dpy, void *surface)
@@ -426,8 +443,9 @@ static unsigned gl_destroy_surface(void *dpy, void *surface)
 static unsigned gl_query_surface(void *dpy, void *surface, int32_t attribute, int32_t *value)
 {
 	unsigned (*query)(void *, void *, int32_t, int32_t *) = gl_real("eglQuerySurface");
+	int done = glwin_query(dpy, surface, attribute, value);
 
-	return glwin_query(surface, attribute, value) ? 1 : query(dpy, surface, attribute, value);
+	return done < 0 ? query(dpy, surface, attribute, value) : (unsigned)done;
 }
 
 static void save_frame(const char *path, void *dpy, void *surface)
@@ -599,6 +617,9 @@ void *host_symbol(const char *name)
 		{ "eglSwapBuffersWithDamageEXT", gl_swap_buffers_with_damage },
 		{ "eglDestroySurface", gl_destroy_surface },
 		{ "eglQuerySurface", gl_query_surface },
+		{ "eglMakeCurrent", gl_make_current },
+		{ "eglGetCurrentSurface", gl_get_current_surface },
+		{ "eglSurfaceAttrib", gl_surface_attrib },
 		{ "glDebugMessageCallback", gl_debug_message_callback },
 		{ "glDebugMessageCallbackKHR", gl_debug_message_callback },
 	};
@@ -610,6 +631,7 @@ void *host_symbol(const char *name)
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
 	pthread_once(&gl_once, gl_open);
+	glwin_init(&gl_host);
 	if (!egl_lib || !gles_lib)
 		return NULL;
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)

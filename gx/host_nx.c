@@ -1004,13 +1004,21 @@ static const struct glwin_host gl_host = { gl_raw, gl_screen, gl_presented };
 static EGLSurface gl_create_window_surface(EGLDisplay dpy, EGLConfig config, void *window,
 					   const void *attribs)
 {
-	void *surface;
+	void *surface = glwin_create(dpy, config, window);
 
-	glwin_init(&gl_host);
-	surface = glwin_create(dpy, config, window);
 	if (!surface)
 		host_log("gx: gl: no surface for a window (%#x)\n", eglGetError());
 	return surface ? surface : EGL_NO_SURFACE;
+}
+
+static EGLSurface gl_get_current_surface(EGLint which)
+{
+	return glwin_current_surface(which);
+}
+
+static EGLBoolean gl_surface_attrib(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint value)
+{
+	return eglSurfaceAttrib(dpy, glwin_surface(surface), attribute, value);
 }
 
 static EGLBoolean gl_destroy_surface(EGLDisplay dpy, EGLSurface surface)
@@ -1028,8 +1036,10 @@ static EGLBoolean gl_query_surface(EGLDisplay dpy, EGLSurface surface, EGLint at
 	EGLBoolean ret;
 	u32 width = 0, height = 0;
 
-	if (glwin_query(surface, attribute, value))
-		return EGL_TRUE;
+	int done = glwin_query(dpy, surface, attribute, value);
+
+	if (done >= 0)
+		return done;
 	ret = eglQuerySurface(dpy, surface, attribute, value);
 	if (ret && value && *value <= 0 && surface == window_surface &&
 	    (attribute == EGL_WIDTH || attribute == EGL_HEIGHT) &&
@@ -1114,7 +1124,7 @@ static EGLSurface gl_create_pbuffer_surface(EGLDisplay dpy, EGLConfig config, co
 static EGLBoolean gl_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext context)
 {
 	static int said, failures;
-	EGLBoolean ret = eglMakeCurrent(dpy, draw, read, context);
+	EGLBoolean ret = glwin_make_current(dpy, draw, read, context) > 0;
 
 	if (!ret && failures++ < 8) {
 		host_log("gx: gl: eglMakeCurrent failed (%#x), surface %p, context %p\n",
@@ -1291,6 +1301,8 @@ void *host_symbol(const char *name)
 		{ "eglTerminate", gl_terminate },
 		{ "eglSwapBuffers", gl_swap_buffers },
 		{ "eglDestroySurface", gl_destroy_surface },
+		{ "eglGetCurrentSurface", gl_get_current_surface },
+		{ "eglSurfaceAttrib", gl_surface_attrib },
 		{ "eglSwapBuffersWithDamageKHR", gl_swap_buffers_with_damage },
 		{ "eglSwapBuffersWithDamageEXT", gl_swap_buffers_with_damage },
 		{ "eglInitialize", gl_initialize },
@@ -1314,6 +1326,7 @@ void *host_symbol(const char *name)
 		return gx_audio_close;
 	if (strncmp(name, "egl", 3) && strncmp(name, "gl", 2))
 		return NULL;
+	glwin_init(&gl_host);
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
 		if (!strcmp(name, ours[i].name))
 			return ours[i].fn;

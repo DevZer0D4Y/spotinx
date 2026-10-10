@@ -4,19 +4,25 @@
  * A program with one window can be given the screen itself to draw on. A
  * browser has more: its menus and the list under its address are windows of
  * their own, each with its own EGL surface, and Wayland (wl.c) only says
- * where they go. So every window surface the guest asks for is an off-screen
- * buffer here, as large as the screen whatever the window's size (a window
- * that grows then needs nothing new: it draws in the bottom left corner of
- * its buffer), and each time one of them is presented, or goes away, the
- * screen is drawn again from all of them: the window, then the popups over
- * it, their pictures copied on the GPU.
+ * where they go. A host may have nothing to draw on but the screen (Horizon's
+ * EGL has no off-screen surfaces), so this is how they share it:
  *
- * All of it happens on the guest's thread that draws, inside the EGL calls it
- * makes, with a context of our own so that nothing of the guest's GL state is
- * touched; what the guest had current is put back before returning.
+ * every window surface the guest asks for is a name of ours for the one
+ * surface there is. The guest draws a window there, in the bottom left corner
+ * (a window believes it is as large as it says, not as the screen), and when
+ * it presents it, what it drew is copied into a texture kept for that window;
+ * then the screen is drawn again from the textures of all the windows, the
+ * window first and the popups over it where wl.c has them, and shown. The
+ * same when a window goes away.
+ *
+ * The copying and the drawing are done in a context of our own, on the
+ * guest's thread that draws and inside the EGL calls it makes, so that
+ * nothing of the guest's GL state is touched; what it had current is put back
+ * before returning. This relies on a guest that draws a window whole and
+ * presents it before it draws another, which is what a browser does.
  *
  * The host gives the functions of its EGL and GLES by name, and the surface
- * that is the screen.
+ * that is the screen; its own EGL functions for the guest call the ones here.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +43,7 @@
 #define GL_BLEND 0x0BE2
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_FLOAT 0x1406
+#define GL_RGB 0x1907
 #define GL_RGBA 0x1908
 #define GL_LINEAR 0x2601
 #define GL_TEXTURE_MAG_FILTER 0x2800
@@ -64,31 +71,36 @@ struct guest_window {
 	} *surface;
 };
 
+/* A window: the address of this is the surface the guest knows. */
 struct window {
-	void *surface;                 /* its buffer: NULL when the slot is free */
+	int used;
 	const struct guest_window *guest;
 	uint32_t id;
 	int32_t width, height;
+	unsigned texture;              /* its picture, once it has presented one */
+	int drawn;
 };
 
 static struct window windows[MAX_WINDOWS];
+static struct window *current;       /* the one the guest has current to draw in */
 static const struct glwin_host *host;
-static void *config, *screen, *context;
-static int ready, failed, direct;
+static void *screen, *context;
+static int ready, failed, opaque;
 
 /* The host's functions, found by name once. */
-static void *(*CreatePbufferSurface)(void *, void *, const int32_t *);
-static unsigned (*DestroySurface)(void *, void *);
 static void *(*CreateContext)(void *, void *, void *, const int32_t *);
 static unsigned (*MakeCurrent)(void *, void *, void *, void *);
 static void *(*GetCurrentContext)(void);
 static void *(*GetCurrentSurface)(int32_t);
 static unsigned (*SwapBuffers)(void *, void *);
+static unsigned (*QuerySurface)(void *, void *, int32_t, int32_t *);
 static int32_t (*GetError)(void);
+static unsigned (*GlError)(void);
 static void (*Viewport)(int32_t, int32_t, int32_t, int32_t);
 static void (*ClearColor)(float, float, float, float);
 static void (*Clear)(unsigned);
 static void (*GenTextures)(int32_t, unsigned *);
+static void (*DeleteTextures)(int32_t, const unsigned *);
 static void (*BindTexture)(unsigned, unsigned);
 static void (*TexParameteri)(unsigned, unsigned, int32_t);
 static void (*CopyTexImage2D)(unsigned, int32_t, unsigned, int32_t, int32_t, int32_t, int32_t, int32_t);
@@ -117,25 +129,27 @@ static int find_functions(void)
 		const char *name;
 		void *slot;
 	} wanted[] = {
-		{ "eglCreatePbufferSurface", &CreatePbufferSurface }, { "eglDestroySurface", &DestroySurface },
-		{ "eglCreateContext", &CreateContext }, { "eglMakeCurrent", &MakeCurrent },
-		{ "eglGetCurrentContext", &GetCurrentContext }, { "eglGetCurrentSurface", &GetCurrentSurface },
-		{ "eglSwapBuffers", &SwapBuffers }, { "eglGetError", &GetError },
+		{ "eglCreateContext", &CreateContext },
+		{ "eglMakeCurrent", &MakeCurrent }, { "eglGetCurrentContext", &GetCurrentContext },
+		{ "eglGetCurrentSurface", &GetCurrentSurface }, { "eglSwapBuffers", &SwapBuffers },
+		{ "eglQuerySurface", &QuerySurface }, { "eglGetError", &GetError }, { "glGetError", &GlError },
 		{ "glViewport", &Viewport }, { "glClearColor", &ClearColor }, { "glClear", &Clear },
-		{ "glGenTextures", &GenTextures }, { "glBindTexture", &BindTexture },
-		{ "glTexParameteri", &TexParameteri }, { "glCopyTexImage2D", &CopyTexImage2D },
-		{ "glEnable", &Enable }, { "glDisable", &Disable }, { "glBlendFunc", &BlendFunc },
-		{ "glCreateProgram", &CreateProgram }, { "glCreateShader", &CreateShader },
-		{ "glShaderSource", &ShaderSource }, { "glCompileShader", &CompileShader },
-		{ "glAttachShader", &AttachShader }, { "glBindAttribLocation", &BindAttribLocation },
-		{ "glLinkProgram", &LinkProgram }, { "glUseProgram", &UseProgram },
-		{ "glGetUniformLocation", &GetUniformLocation }, { "glUniform4f", &Uniform4f },
-		{ "glVertexAttribPointer", &VertexAttribPointer },
+		{ "glGenTextures", &GenTextures }, { "glDeleteTextures", &DeleteTextures },
+		{ "glBindTexture", &BindTexture }, { "glTexParameteri", &TexParameteri },
+		{ "glCopyTexImage2D", &CopyTexImage2D }, { "glEnable", &Enable }, { "glDisable", &Disable },
+		{ "glBlendFunc", &BlendFunc }, { "glCreateProgram", &CreateProgram },
+		{ "glCreateShader", &CreateShader }, { "glShaderSource", &ShaderSource },
+		{ "glCompileShader", &CompileShader }, { "glAttachShader", &AttachShader },
+		{ "glBindAttribLocation", &BindAttribLocation }, { "glLinkProgram", &LinkProgram },
+		{ "glUseProgram", &UseProgram }, { "glGetUniformLocation", &GetUniformLocation },
+		{ "glUniform4f", &Uniform4f }, { "glVertexAttribPointer", &VertexAttribPointer },
 		{ "glEnableVertexAttribArray", &EnableVertexAttribArray }, { "glDrawArrays", &DrawArrays },
 	};
 
+	if (DrawArrays)
+		return 0;
 	for (size_t i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
-		void *fn = host->symbol(wanted[i].name);
+		void *fn = host ? host->symbol(wanted[i].name) : NULL;
 
 		if (!fn) {
 			host_log("gx: gl: the host has no %s\n", wanted[i].name);
@@ -153,10 +167,9 @@ void glwin_init(const struct glwin_host *h)
 
 static struct window *window_of(void *surface)
 {
-	for (int i = 0; i < MAX_WINDOWS; i++)
-		if (surface && windows[i].surface == surface)
-			return &windows[i];
-	return NULL;
+	struct window *w = surface;
+
+	return w >= windows && w < windows + MAX_WINDOWS && w->used ? w : NULL;
 }
 
 /* What the guest says of its window now, while the window is surely there. */
@@ -175,7 +188,7 @@ static void measure(struct window *w)
 
 /* Our context, current on the screen: made the first time, with the little
  * it takes to draw a picture in a rectangle. */
-static int prepare(void *dpy)
+static int prepare(void *dpy, void *config)
 {
 	static const int32_t version[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
 	static const char *const vertex =
@@ -185,15 +198,13 @@ static int prepare(void *dpy)
 		"precision mediump float; uniform sampler2D s; varying vec2 t;\n"
 		"void main() { gl_FragColor = texture2D(s, t); }\n";
 	static const float corners[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
-	unsigned program, texture, shader;
+	unsigned program, shader;
 
-	if (failed)
+	if (failed || !screen)
 		return -1;
-	if (!screen)
-		screen = host->screen(dpy, config);
-	if (screen && !context)
+	if (!context && config)
 		context = CreateContext(dpy, config, NULL, version);
-	if (!screen || !context || !MakeCurrent(dpy, screen, screen, context)) {
+	if (!context || !MakeCurrent(dpy, screen, screen, context)) {
 		host_log("gx: gl: cannot draw on the screen (%#x)\n", GetError());
 		failed = 1;
 		return -1;
@@ -214,12 +225,6 @@ static int prepare(void *dpy)
 	LinkProgram(program);
 	UseProgram(program);
 	where = GetUniformLocation(program, "r");
-	GenTextures(1, &texture);
-	BindTexture(GL_TEXTURE_2D, texture);
-	TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	VertexAttribPointer(0, 2, GL_FLOAT, 0, 0, corners);
 	EnableVertexAttribArray(0);
 	Viewport(0, 0, WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT);
@@ -227,20 +232,45 @@ static int prepare(void *dpy)
 	return 0;
 }
 
-/* Draws one window where it goes: its picture is read from its buffer (what
- * is read from is whatever surface is current for reading) into the texture,
- * and the texture drawn. (x, y) is its top left corner on the screen. */
-static void draw(void *dpy, const struct window *w, int32_t x, int32_t y, int blend)
+/* Keeps what the guest just drew for a window: the bottom left corner of the
+ * screen's buffer, of the window's size, into the window's texture. With its
+ * opacity if the screen has one to give (popups have round corners and a
+ * shadow), without if it has not. */
+static void keep(struct window *w)
+{
+	if (!w->texture) {
+		GenTextures(1, &w->texture);
+		BindTexture(GL_TEXTURE_2D, w->texture);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
+	BindTexture(GL_TEXTURE_2D, w->texture);
+	while (GlError())
+		;
+	if (!opaque) {
+		CopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w->width, w->height, 0);
+		if (GlError()) {
+			host_log("gx: gl: the screen has no opacity to copy: popups will be plain rectangles\n");
+			opaque = 1;
+		}
+	}
+	if (opaque)
+		CopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, w->width, w->height, 0);
+	w->drawn = 1;
+}
+
+/* Draws one window where it goes; (x, y) is its top left corner. */
+static void draw(const struct window *w, int32_t x, int32_t y, int blend)
 {
 	float left = 2.0f * x / WL_SCREEN_WIDTH - 1.0f;
 	float right = 2.0f * (x + w->width) / WL_SCREEN_WIDTH - 1.0f;
 	float top = 1.0f - 2.0f * y / WL_SCREEN_HEIGHT;
 	float bottom = 1.0f - 2.0f * (y + w->height) / WL_SCREEN_HEIGHT;
 
-	if (!MakeCurrent(dpy, screen, w->surface, context))
-		return;
-	CopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w->width, w->height, 0);
-	if (blend)
+	BindTexture(GL_TEXTURE_2D, w->texture);
+	if (blend && !opaque)
 		Enable(GL_BLEND);
 	else
 		Disable(GL_BLEND);
@@ -248,28 +278,33 @@ static void draw(void *dpy, const struct window *w, int32_t x, int32_t y, int bl
 	DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-/* The screen, from all the windows there are. */
-static void present(void *dpy)
+/* The screen, from all the windows there are; keeping first what was just
+ * drawn for one of them, if any. In our context, and what the guest had
+ * current is put back. */
+static void present(void *dpy, struct window *presented, unsigned gone)
 {
 	void *was_context = GetCurrentContext();
 	void *was_draw = GetCurrentSurface(EGL_DRAW), *was_read = GetCurrentSurface(EGL_READ);
 	int32_t x, y;
 
-	if (!prepare(dpy)) {
+	if (!prepare(dpy, NULL)) {
+		if (presented)
+			keep(presented);
+		if (gone)
+			DeleteTextures(1, &gone);
 		ClearColor(0, 0, 0, 1);
 		Clear(GL_COLOR_BUFFER_BIT);
 		/* The window, then the popups in the order wl.c has them, which
 		 * is the order they came in. */
 		for (int i = 0; i < MAX_WINDOWS; i++)
-			if (windows[i].surface &&
+			if (windows[i].used && windows[i].drawn &&
 			    (!windows[i].guest || wl_surface_place(windows[i].id, &x, &y) == 1))
-				draw(dpy, &windows[i], 0, 0, 0);
+				draw(&windows[i], 0, 0, 0);
 		for (int order = 0; order < MAX_WINDOWS; order++)
 			for (int i = 0; i < MAX_WINDOWS; i++)
-				if (windows[i].surface &&
+				if (windows[i].used && windows[i].drawn && windows[i].guest &&
 				    wl_surface_place(windows[i].id, &x, &y) == 2 + order)
-					draw(dpy, &windows[i], x, y, 1);
-		MakeCurrent(dpy, screen, screen, context);
+					draw(&windows[i], x, y, 1);
 		if (host->presented)
 			host->presented(dpy, screen);
 		SwapBuffers(dpy, screen);
@@ -277,51 +312,40 @@ static void present(void *dpy)
 	MakeCurrent(dpy, was_draw, was_read, was_context);
 }
 
-void *glwin_create(void *dpy, void *cfg, void *guest_window)
+void *glwin_create(void *dpy, void *config, void *guest_window)
 {
-	static const int32_t size[] = { EGL_WIDTH, WL_SCREEN_WIDTH, EGL_HEIGHT, WL_SCREEN_HEIGHT, EGL_NONE };
 	struct window *w = NULL;
-	void *surface;
 
-	if (!host || (!CreatePbufferSurface && find_functions()))
+	if (find_functions())
 		return NULL;
-	if (direct)
-		return NULL;
-	if (!config)
-		config = cfg;
 	for (int i = 0; i < MAX_WINDOWS && !w; i++)
-		if (!windows[i].surface)
+		if (!windows[i].used)
 			w = &windows[i];
-	surface = w ? CreatePbufferSurface(dpy, cfg, size) : NULL;
-	if (!surface) {
-		/* A host that cannot: the first window is given the screen as
-		 * it is, and that is all there will be to see. */
-		if (!screen && !failed) {
-			host_log("gx: gl: no off-screen buffer for a window (%#x): the screen itself, "
-				 "and one window\n", GetError());
-			direct = 1;
-			screen = host->screen(dpy, cfg);
-			return screen;
-		}
+	if (!w)
 		return NULL;
+	if (!screen) {
+		void *was_context = GetCurrentContext();
+		void *was_draw = GetCurrentSurface(EGL_DRAW), *was_read = GetCurrentSurface(EGL_READ);
+
+		screen = host->screen(dpy, config);
+		if (!screen)
+			return NULL;
+		prepare(dpy, config);
+		MakeCurrent(dpy, was_draw, was_read, was_context);
 	}
-	w->surface = surface;
+	memset(w, 0, sizeof(*w));
+	w->used = 1;
 	w->guest = guest_window;
 	measure(w);
 	if (gx_trace)
 		host_log("gx: gl: a window surface for wl_surface %u, %dx%d\n", w->id, w->width, w->height);
-	return surface;
+	return w;
 }
 
 int glwin_swap(void *dpy, void *surface)
 {
 	struct window *w = window_of(surface);
 
-	if (direct && surface == screen) {
-		if (host->presented)
-			host->presented(dpy, screen);
-		return SwapBuffers(dpy, screen) ? 1 : 0;
-	}
 	if (!w)
 		return -1;
 	measure(w);
@@ -334,30 +358,67 @@ int glwin_swap(void *dpy, void *surface)
 	/* A popup that is drawn this way has no picture of the other kind to
 	 * give wl.c its size, which it needs to tell what a finger is on. */
 	wl_surface_size(w->id, w->width, w->height);
-	present(dpy);
+	present(dpy, w, 0);
 	return 1;
 }
 
 int glwin_destroy(void *dpy, void *surface)
 {
 	struct window *w = window_of(surface);
+	unsigned texture;
 
 	if (!w)
 		return -1;
 	/* What it showed is taken off the screen by drawing the rest again. */
+	texture = w->texture;
+	if (current == w)
+		current = NULL;
 	memset(w, 0, sizeof(*w));
 	if (ready)
-		present(dpy);
-	return DestroySurface(dpy, surface) ? 1 : 0;
+		present(dpy, NULL, texture);
+	return 1;
 }
 
-int glwin_query(void *surface, int32_t attribute, int32_t *value)
+int glwin_query(void *dpy, void *surface, int32_t attribute, int32_t *value)
 {
 	struct window *w = window_of(surface);
 
-	if (!w || !value || (attribute != EGL_WIDTH && attribute != EGL_HEIGHT))
+	if (!w)
+		return -1;
+	if (value && (attribute == EGL_WIDTH || attribute == EGL_HEIGHT)) {
+		measure(w);
+		*value = attribute == EGL_WIDTH ? w->width : w->height;
+		return 1;
+	}
+	return QuerySurface(dpy, screen, attribute, value) ? 1 : 0;
+}
+
+void *glwin_surface(void *surface)
+{
+	return window_of(surface) ? screen : surface;
+}
+
+int glwin_make_current(void *dpy, void *draw, void *read, void *ctx)
+{
+	struct window *w = window_of(draw);
+
+	if (find_functions())
+		return -1;
+	if (!MakeCurrent(dpy, glwin_surface(draw), glwin_surface(read), ctx))
 		return 0;
-	measure(w);
-	*value = attribute == EGL_WIDTH ? w->width : w->height;
+	/* Which of the windows it is now drawing in: they are all the same
+	 * surface underneath. */
+	if (w || !draw || glwin_surface(draw) != screen)
+		current = w;
 	return 1;
+}
+
+void *glwin_current_surface(int32_t which)
+{
+	void *real;
+
+	if (find_functions())
+		return NULL;
+	real = GetCurrentSurface(which);
+	return real && real == screen && current ? (void *)current : real;
 }
