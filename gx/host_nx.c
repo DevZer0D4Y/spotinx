@@ -2611,11 +2611,15 @@ int main(int argc, char **argv)
 		know_thread(display_thread.handle, "display");
 		threadStart(&display_thread);
 	}
-	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, 0x2C, -2))) {
+	/* These two at the guest's priority, the lowest: what they do every ten
+	 * seconds (asking the kernel about every block of memory, writing the
+	 * log to the card) took the processor from the guest's threads for as
+	 * long, and a video being played stopped for a moment each time. */
+	if (R_SUCCEEDED(threadCreate(&watchdog_thread, watchdog, NULL, NULL, 0x10000, GUEST_PRIO, -2))) {
 		free_cores(watchdog_thread.handle);
 		threadStart(&watchdog_thread);
 	}
-	if (R_SUCCEEDED(threadCreate(&probe_thread, kernel_probe, NULL, NULL, 0x10000, 0x2C, -2))) {
+	if (R_SUCCEEDED(threadCreate(&probe_thread, kernel_probe, NULL, NULL, 0x10000, GUEST_PRIO, -2))) {
 		free_cores(probe_thread.handle);
 		know_thread(probe_thread.handle, "probe");
 		threadStart(&probe_thread);

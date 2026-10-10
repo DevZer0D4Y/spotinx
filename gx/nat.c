@@ -78,6 +78,7 @@ struct tcp_conn {
 	int host_eof, fin_sent, fin_acked, guest_fin, dup_acks;
 	uint64_t timer;                    /* last progress, for retransmission */
 	uint64_t active;                   /* last time anything went either way */
+	uint32_t life;                     /* which of the connections this slot has held */
 };
 
 struct udp_flow {
@@ -90,6 +91,7 @@ struct udp_flow {
 	uint8_t question[512];
 	uint16_t question_len, question_port;
 	uint8_t asked;                     /* times: 0 when there is none waiting */
+	uint32_t life;                     /* which of the exchanges this slot has held */
 	uint64_t asked_at, first_asked;
 };
 
@@ -106,6 +108,7 @@ struct nat {
 	int wake_fd;                       /* a UDP socket connected to itself */
 	int closing;
 	uint32_t dns, dns2;                /* host byte order; dns2 may be 0 */
+	uint32_t lives;                    /* connections opened so far */
 	uint16_t ip_id;
 	struct tcp_conn tcp[MAX_TCP];
 	struct udp_flow udp[MAX_UDP];
@@ -358,6 +361,7 @@ static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t 
 	c->rcv_nxt = seq + 1;
 	c->guest_window = window;
 	c->timer = c->active = now_ms();
+	c->life = ++nat->lives;
 	if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) && errno != EINPROGRESS) {
 		COMPLAIN("cannot connect to %u.%u.%u.%u:%u (error %d)\n", remote >> 24, remote >> 16 & 255,
 			 remote >> 8 & 255, remote & 255, rport, errno);
@@ -468,6 +472,8 @@ static void tcp_host_event(struct nat *nat, struct tcp_conn *c, int revents)
 		int error = 0;
 		socklen_t len = sizeof(error);
 
+		if (!(revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)))
+			return;
 		if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &error, &len) || error ||
 		    (revents & (POLLERR | POLLHUP | POLLNVAL))) {
 			COMPLAIN("connection to %u.%u.%u.%u:%u failed (error %d, events %#x)\n",
@@ -583,6 +589,8 @@ static struct udp_flow *udp_flow(struct nat *nat, uint16_t gport)
 	}
 	set_nonblocking(f->fd);
 	f->gport = gport;
+	f->life = ++nat->lives;
+	f->asked = 0;
 	return f;
 }
 
@@ -754,8 +762,13 @@ static int nat_poll(struct lkl_netdev *nd)
 {
 	struct nat *nat = (struct nat *)nd;
 	struct pollfd fds[1 + MAX_TCP + MAX_UDP];
-	/* What each entry was when the lock was dropped: it may be gone after. */
-	struct { int index, fd; } who[1 + MAX_TCP + MAX_UDP];
+	/* What each entry was when the lock was dropped: it may be gone after,
+	 * and another in its place with the same descriptor, since the host
+	 * gives out the lowest free one. A connection that was just opened was
+	 * then told what the socket of the one before it had to say, and taken
+	 * for connected: its first bytes were lost, which a TLS handshake does
+	 * not survive. */
+	struct { int index, fd; uint32_t life; } who[1 + MAX_TCP + MAX_UDP];
 
 	pthread_mutex_lock(&nat->lock);
 	for (;;) {
@@ -787,6 +800,7 @@ static int nat_poll(struct lkl_netdev *nd)
 			fds[n].fd = c->fd;
 			fds[n].events = events;
 			who[n].index = i;
+			who[n].life = c->life;
 			who[n++].fd = c->fd;
 		}
 		for (int i = 0; i < MAX_UDP; i++) {
@@ -801,6 +815,7 @@ static int nat_poll(struct lkl_netdev *nd)
 			fds[n].fd = f->fd;
 			fds[n].events = POLLIN;
 			who[n].index = MAX_TCP + i;
+			who[n].life = f->life;
 			who[n++].fd = f->fd;
 		}
 
@@ -825,9 +840,11 @@ static int nat_poll(struct lkl_netdev *nd)
 			if (!fds[k].revents)
 				continue;
 			if (i < MAX_TCP) {
-				if (nat->tcp[i].state != T_FREE && nat->tcp[i].fd == who[k].fd)
+				if (nat->tcp[i].state != T_FREE && nat->tcp[i].fd == who[k].fd &&
+				    nat->tcp[i].life == who[k].life)
 					tcp_host_event(nat, &nat->tcp[i], fds[k].revents);
-			} else if (nat->udp[i - MAX_TCP].fd == who[k].fd) {
+			} else if (nat->udp[i - MAX_TCP].fd == who[k].fd &&
+				   nat->udp[i - MAX_TCP].life == who[k].life) {
 				udp_host_event(nat, &nat->udp[i - MAX_TCP]);
 			}
 		}
