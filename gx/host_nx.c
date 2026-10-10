@@ -592,6 +592,9 @@ int host_commit(void *addr, size_t len, int prot)
 		for (size_t i = 0; i < run; i++) {
 			set_page(first + done + i, src + i, PG_MAPPED | P_FRESH);
 		}
+		/* Two more records for the kernel, until they are next counted:
+		 * the guard at the top looks at this number. */
+		kernel_blocks += 2;
 		done += run;
 	}
 	if (!ret)

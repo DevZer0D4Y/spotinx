@@ -45,7 +45,12 @@
 #define VENEER_SIZE 32
 #define BRANCH_RANGE (128L << 20)
 #define MAX_IMAGES 1024
-#define DATA_UNIT (256UL << 10)   /* what data is committed by, inside reservations */
+/* What data is committed by, inside reservations. Large, because a host may
+ * pay for every piece it is asked to map whatever its size: Horizon keeps two
+ * records per piece, never merged with their neighbours, and has room for
+ * about ten thousand in all; a browser with a gigabyte of data in pieces of
+ * 256 KB went through them. */
+#define DATA_UNIT (1UL << 20)
 #define DATA_PROT (GX_PROT_READ | GX_PROT_WRITE)
 #define MAX_SHARED 512
 #define MAX_VIEWS 4096
@@ -346,8 +351,15 @@ static int commit_data(uint64_t addr, uint64_t len, int prot)
 			count_committed(DATA_UNIT / GX_PAGE, page_of(unit) + DATA_UNIT / GX_PAGE);
 			continue;
 		}
-		/* A unit with something else in it: what is asked, no more, and
-		 * only what an earlier unit did not bring. */
+		/* A unit with something else in it: what is asked and, of the
+		 * unit, the plain reservation on either side of it, which is
+		 * likely to be asked for next. */
+		while (from > unit && in_arena(from - GX_PAGE, GX_PAGE) &&
+		       page_state[page_of(from - GX_PAGE)] == PG_USED && !image_of(from - GX_PAGE))
+			from -= GX_PAGE;
+		while (to < unit + DATA_UNIT && in_arena(to, GX_PAGE) &&
+		       page_state[page_of(to)] == PG_USED && !image_of(to))
+			to += GX_PAGE;
 		for (uint64_t a = from; a < to;) {
 			uint64_t b = a;
 
