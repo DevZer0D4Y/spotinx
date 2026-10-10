@@ -119,6 +119,7 @@ struct positioner {
 struct popup {
 	uint32_t id, surface, xdg;           /* id is 0 when the slot is free */
 	int32_t x, y;                        /* where its picture goes on the screen */
+	int32_t from_x, from_y;              /* a subsurface: where its parent's is */
 	int32_t width, height;               /* of the picture, once there is one */
 	uint8_t *pixels;
 };
@@ -594,8 +595,27 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		create(w[0], opcode == 0 ? T_SURFACE : T_REGION, o->version);
 		break;
 	case T_SUBCOMPOSITOR:
-		if (opcode == 1)
-			create(w[0], T_SUBSURFACE, 1);
+		if (opcode == 1) {            /* get_subsurface(new id, surface, parent) */
+			/* A surface that goes with another, at a place the client
+			 * gives outright: what a browser draws the list under its
+			 * address in. It is laid over the window like a popup. */
+			struct popup *p = NULL;
+
+			create(w[0], T_SUBSURFACE, 1)->surface = w[1];
+			for (int i = 0; i < MAX_POPUPS && !p; i++)
+				if (!popups[i].id)
+					p = &popups[i];
+			if (p) {
+				struct popup *above = popup_of(w[2]);
+
+				p->id = w[0];
+				p->surface = w[1];
+				p->from_x = above ? above->x : 0;
+				p->from_y = above ? above->y : 0;
+				p->x = p->from_x;
+				p->y = p->from_y;
+			}
+		}
 		break;
 	case T_SHM:
 		if (opcode == 0) {            /* create_pool: an fd came with it */
@@ -814,8 +834,21 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 			configure_window(&objects[o->surface], opcode == 11);
 		}
 		break;
-	case T_REGION:
 	case T_SUBSURFACE:
+		if (opcode == 0 || opcode == 1) {
+			struct popup *p = popup_of(o->surface);
+
+			if (p && p->id == id && opcode == 0) {
+				popup_gone(p);
+			} else if (p && p->id == id) {   /* set_position, in its parent */
+				p->x = p->from_x + (int32_t)w[0];
+				p->y = p->from_y + (int32_t)w[1];
+			}
+		}
+		if (opcode == 0)
+			delete_id(id);
+		break;
+	case T_REGION:
 		if (opcode == 0)
 			delete_id(id);
 		break;
