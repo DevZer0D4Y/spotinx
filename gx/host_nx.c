@@ -67,11 +67,15 @@
 	"--enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on
- * a busy site went through 192 MB and the kernel panicked. */
-#define KERNEL_ARGS "mem=512M loglevel=4"
-/* Left to malloc for stacks, libnx and the GPU driver; less when the homebrew
- * runs as an applet and the whole heap is a few hundred megabytes. */
-#define HEAP_KEPT (256UL << 20)
+ * a busy site went through 192 MB and the kernel panicked. With a profile
+ * on a disk of its own and the page cache dropped when little is free
+ * (gsys.c), 400 of 512 MB stayed free while a browser played videos. */
+#define KERNEL_ARGS "mem=384M loglevel=4"
+/* Left to malloc for stacks (a megabyte a thread, eighty threads), libnx, the
+ * GPU driver and the video decoder, whose pictures are here too: with 256 MB a
+ * third 1080p video in a row left no stack for a new thread. Less when the
+ * homebrew runs as an applet and the whole heap is a few hundred megabytes. */
+#define HEAP_KEPT (384UL << 20)
 #define HEAP_KEPT_SMALL (48UL << 20)
 #define POOL_WORTH_IT (192UL << 20)
 /* Host functions called for the guest (the GL driver) run on these too. */
