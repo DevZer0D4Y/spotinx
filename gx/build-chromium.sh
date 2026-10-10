@@ -97,7 +97,7 @@ if [ "${1:-}" = wayland ]; then
 	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w \
 		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$IMAGE" \
 		/usr/lib/chromium/chromium-shell --no-sandbox --single-process --no-zygote \
-		$gpu --js-flags=--jitless --ozone-platform=wayland \
+		$gpu ${GX_JS---js-flags=--jitless} --ozone-platform=wayland \
 		"${@:-file:///usr/share/gx/page.html}"
 fi
 if [ "${1:-}" = browse ]; then
@@ -119,4 +119,4 @@ fi
 # compilers (--jitless): they need memory that is writable and executable at
 # once, which Horizon does not have and gx refuses everywhere.
 exec timeout ${GX_TIMEOUT:-600} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n $export_arg "$IMAGE" $CHROMIUM \
-	--no-sandbox --single-process --no-zygote --disable-gpu --js-flags=--jitless "$@"
+	--no-sandbox --single-process --no-zygote --disable-gpu ${GX_JS---js-flags=--jitless} "$@"

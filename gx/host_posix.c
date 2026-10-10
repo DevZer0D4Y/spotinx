@@ -678,6 +678,22 @@ static void on_fault(int sig, siginfo_t *info, void *uctx)
 	uint64_t pc = uc->uc_mcontext.pc, base = 0;
 	int kind = gmem_describe(pc, &base);
 
+	if (sig == SIGSEGV) {
+		/* Memory that is writable or executable by turns (gmem.c)? On
+		 * the host's thread pointer to find out: this may be the guest
+		 * running. */
+		uint64_t tp, addr = (uint64_t)info->si_addr;
+		int fixed;
+
+		__asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+		for (int i = 0; i < GX_MAX_THREADS; i++)
+			if (gx_tp_tab[i].guest_tp == tp)
+				__asm__ volatile("msr tpidr_el0, %0" : : "r"(gx_tp_tab[i].thread->host_tp));
+		fixed = gmem_fault(addr, addr == pc);
+		__asm__ volatile("msr tpidr_el0, %0" : : "r"(tp));
+		if (fixed)
+			return;
+	}
 	put_hex("gx: fault, signal ", sig);
 	put_hex("  address ", (uint64_t)info->si_addr);
 	put_hex("  pc      ", pc);

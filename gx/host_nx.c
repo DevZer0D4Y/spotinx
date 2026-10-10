@@ -699,10 +699,37 @@ void host_flush_icache(void *addr, size_t len)
 /* ---------- threads ---------- */
 
 struct start {
-	Thread thread;
+	Thread thread;         /* first: threadGetSelf() of the thread finds this */
 	void (*fn)(void *);
 	void *arg;
+	struct start *next;    /* among the threads that ended */
 };
+
+/* A thread cannot give back its own stack and its record in the kernel; the
+ * ones that ended wait here for another thread to do it. A browser playing a
+ * video goes through hundreds of short-lived threads, a megabyte of stack
+ * each, and the kernel counts the threads a process may have. */
+static struct start *ended;
+static Mutex ended_lock;
+
+static void bury_threads(void)
+{
+	struct start *s;
+
+	mutexLock(&ended_lock);
+	s = ended;
+	ended = NULL;
+	mutexUnlock(&ended_lock);
+	while (s) {
+		struct start *next = s->next;
+
+		/* It is on its way out, if not out already. */
+		threadWaitForExit(&s->thread);
+		threadClose(&s->thread);
+		free(s);
+		s = next;
+	}
+}
 
 static int next_core;
 
@@ -721,6 +748,7 @@ static int start_thread(void (*fn)(void *), void *arg, size_t stack)
 
 	if (!s)
 		return -1;
+	bury_threads();
 	s->fn = fn;
 	s->arg = arg;
 	rc = threadCreate(&s->thread, thread_start, s, NULL, stack, GUEST_PRIO, core);
@@ -749,6 +777,12 @@ int host_thread_start(void (*fn)(void *), void *arg)
 
 void host_thread_exit(void)
 {
+	struct start *s = (struct start *)threadGetSelf();
+
+	mutexLock(&ended_lock);
+	s->next = ended;
+	ended = s;
+	mutexUnlock(&ended_lock);
 	threadExit();
 	__builtin_unreachable();
 }
@@ -1080,6 +1114,23 @@ static void report_address(const char *label, uint64_t addr)
 
 /* Runs on the faulting thread, which never leaves: the screen and the log
  * stay readable until + is pressed. */
+/* Called by the exception entry (nx/exception.S) for memory that refused a
+ * jump or an access, on the stack of the thread it happened to: returns
+ * whether the thread is to try again. */
+int gx_nx_fault(u64 addr, int exec)
+{
+	static int said;
+	int fixed = gmem_fault(addr, exec);
+
+	/* The first ones, to tell in the log how far this got. */
+	if (fixed && said < 4 && __atomic_fetch_add(&said, 1, __ATOMIC_SEQ_CST) < 4) {
+		host_log("gx: compiled code: %s at %#lx\n", exec ? "a jump" : "a write",
+			 (unsigned long)addr);
+		sync_log();
+	}
+	return fixed;
+}
+
 void __libnx_exception_handler(ThreadExceptionDump *ctx)
 {
 	static int reported;
@@ -1819,6 +1870,8 @@ static void watchdog(void *arg)
 		if (finished)
 			break;
 		host_log("gx: after %d s\n", seconds);
+		bury_threads();
+		gmem_report();
 		if (gl_swaps != swaps) {
 			host_log("gx: gl: %u pictures in 10 s\n", gl_swaps - swaps);
 			swaps = gl_swaps;

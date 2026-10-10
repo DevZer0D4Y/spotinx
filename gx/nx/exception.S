@@ -68,6 +68,69 @@ CODE_BEGIN __libnx_exception_entry
     bl svcReturnFromException
     b .
 .Lgx_not_counter:
+    // gx, a second addition: a jump or an access that memory refused may be
+    // to memory that is writable or executable by turns (gmem.c), which the
+    // fault is there to turn around. To find out takes C, and everything C
+    // may change is the thread's still, so it is kept: x9-x18 and the vector
+    // registers.
+    ldr w2, [x1, #108]
+    lsr w2, w2, #26
+    cmp w2, #0x20               // instruction abort
+    beq 1f
+    cmp w2, #0x24               // data abort
+    bne .Lgx_not_ours
+1:  mov x3, sp
+    // The stack to use is the one the thread was on (sp of the context),
+    // not the one given here: that one is a corner of the thread's local
+    // storage, with room for little. Below the context too, should the
+    // kernel have put it on that stack.
+    ldr x4, [x1, #80]
+    sub x5, x4, x1
+    cmp x5, #4096
+    csel x4, x1, x4, lo
+    sub x4, x4, #1024
+    and x4, x4, #~15
+    stp x0, x1, [x4, #0]
+    stp x9, x10, [x4, #16]
+    stp x11, x12, [x4, #32]
+    stp x13, x14, [x4, #48]
+    stp x15, x16, [x4, #64]
+    stp x17, x18, [x4, #80]
+    stp x3, x29, [x4, #96]
+    mrs x5, fpcr
+    mrs x6, fpsr
+    stp x5, x6, [x4, #112]
+    add x5, x4, #128
+    .irp n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    str q\n, [x5, #(\n * 16)]
+    .endr
+    mov sp, x4
+    ldr x0, [x1, #112]          // the address that was refused
+    cmp w2, #0x20
+    cset w1, eq                 // as a jump?
+    bl gx_nx_fault
+    mov w7, w0
+    mov x4, sp
+    add x5, x4, #128
+    .irp n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    ldr q\n, [x5, #(\n * 16)]
+    .endr
+    ldp x5, x6, [x4, #112]
+    msr fpcr, x5
+    msr fpsr, x6
+    ldp x9, x10, [x4, #16]
+    ldp x11, x12, [x4, #32]
+    ldp x13, x14, [x4, #48]
+    ldp x15, x16, [x4, #64]
+    ldp x17, x18, [x4, #80]
+    ldp x3, x29, [x4, #96]
+    ldp x0, x1, [x4, #0]
+    mov sp, x3
+    cbz w7, .Lgx_not_ours
+    mov w0, wzr                 // turned around: the thread tries again
+    bl svcReturnFromException
+    b .
+.Lgx_not_ours:
 
     // Abort exception handling when __libnx_exception_handler is not defined.
     adrp x5, :got:__libnx_exception_handler

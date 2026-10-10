@@ -144,6 +144,13 @@ if [ -e "$PC_OUT/chromium.ext4" ]; then
 		echo "[Chromium GPU: speed test] $G $A"
 		echo "[Chromium GPU: wikipedia.org] $G https://www.wikipedia.org/"
 		echo "[Chromium GPU: google.com] $G https://www.google.com/"
+		# And with V8's compilers: memory writable and executable by
+		# turns (gmem.c) is what they needed.
+		J="${G/ --js-flags=--jitless/}"
+		echo "[Chromium GPU+JIT: speed test] $J $A"
+		echo "[Chromium GPU+JIT: wikipedia.org] $J https://www.wikipedia.org/"
+		echo "[Chromium GPU+JIT: google.com] $J https://www.google.com/"
+		echo "[Chromium GPU+JIT: youtube.com] $J https://www.youtube.com/"
 		echo "[Chromium WINDOW: google.com] $W https://www.google.com/"
 		echo "[Chromium WINDOW: wikipedia.org] $W https://www.wikipedia.org/"
 		echo "[Chromium WINDOW: speed test] $W $A"

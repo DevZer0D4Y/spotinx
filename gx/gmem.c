@@ -186,6 +186,7 @@ static uint64_t find_free_anonymous(uint64_t size)
  * most, and how far into the arena the guest got. */
 static uint64_t committed_pages, committed_peak, top_page;
 static int chunk_count, chunk_peak;   /* pieces of the host's shared memory */
+static uint64_t wx_to_write, wx_to_exec;   /* see gmem_fault() */
 
 static void count_committed(int64_t pages, uint64_t last_page)
 {
@@ -202,6 +203,9 @@ void gmem_report(void)
 		 "%d pieces of shared memory at most\n",
 		 (unsigned long)(committed_peak >> 8), (unsigned long)(committed_pages >> 8),
 		 (unsigned long)(top_page >> 8), chunk_peak);
+	if (wx_to_write || wx_to_exec)
+		host_log("gx: compiled code: made writable %lu times, executable %lu times\n",
+			 (unsigned long)wx_to_write, (unsigned long)wx_to_exec);
 }
 
 static void release(uint64_t addr, uint64_t len)
@@ -234,6 +238,75 @@ static int commit(uint64_t addr, uint64_t len, int prot)
 }
 
 static struct image *image_of(uint64_t addr);
+
+/*
+ * Memory the guest wants writable and executable at once: what a compiler
+ * that runs inside a program (V8's) writes its code to, one large piece asked
+ * for once. A host may not have such memory (Horizon does not), so a page of
+ * it is one or the other at any time, whichever was needed last: nothing is
+ * there until the page is touched, and the fault of a write to a page that is
+ * executable, or of a jump to one that is writable, turns it into the other
+ * (gmem_fault(), which the host calls). Such a page is known by its
+ * protection, all three; PG_COMMITTED says whether it is there.
+ *
+ * Whole units change together: the host keeps a record per run of pages
+ * mapped alike, and compiled code comes in small pieces.
+ */
+#define WX_UNIT (256UL << 10)
+#define WX_PROT (GX_PROT_READ | GX_PROT_WRITE | GX_PROT_EXEC)
+
+static int is_wx(uint8_t state)
+{
+	return (state & (PG_USED | PG_SHARED | PG_COPY | PG_HOLE | PG_PROT)) == (PG_USED | WX_PROT);
+}
+
+int gmem_fault(uint64_t addr, int exec)
+{
+	int prot = GX_PROT_READ | (exec ? GX_PROT_EXEC : GX_PROT_WRITE);
+	uint64_t first, end, at;
+	int ret = 0;
+
+	if (!arena || !in_arena(addr, 1))
+		return 0;
+	host_lock_acquire(lock);
+	at = page_of(addr);
+	if (is_wx(page_state[at])) {
+		first = at & ~(WX_UNIT / GX_PAGE - 1);
+		end = first + WX_UNIT / GX_PAGE;
+		if (end > arena_size / GX_PAGE)
+			end = arena_size / GX_PAGE;
+		ret = 1;
+		for (uint64_t p = first, q; p < end; p = q) {
+			uint8_t state = page_state[p];
+			void *run = arena + p * GX_PAGE;
+			int failed;
+
+			for (q = p; q < end && page_state[q] == state; q++)
+				;
+			if (!is_wx(state))
+				continue;
+			if (state & PG_COMMITTED) {
+				failed = host_protect(run, (q - p) * GX_PAGE, prot);
+			} else {
+				failed = host_commit(run, (q - p) * GX_PAGE, prot);
+				if (!failed) {
+					memset(&page_state[p], state | PG_COMMITTED, q - p);
+					count_committed(q - p, q);
+				}
+			}
+			if (failed && at >= p && at < q)
+				ret = 0;
+			else if (!failed && exec)
+				host_flush_icache(run, (q - p) * GX_PAGE);
+		}
+		if (exec)
+			wx_to_exec++;
+		else
+			wx_to_write++;
+	}
+	host_lock_release(lock);
+	return ret;
+}
 
 /* Whether memory at addr, for a given protection, is data in the sense above:
  * not code, and not part of a file's image (where a page is what its segment
@@ -865,6 +938,13 @@ static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
 			return -GX_ENOMEM;
 	}
 
+	if (anonymous && (prot & PG_PROT) == WX_PROT) {
+		/* Nothing of it is there until it is touched: see gmem_fault(). */
+		if (commit(addr, size, 0))
+			return -GX_ENOMEM;
+		memset(&page_state[page_of(addr)], PG_USED | WX_PROT, size / GX_PAGE);
+		return (long)addr;
+	}
 	if (anonymous) {
 		/* Data is the host's to read and write whatever the guest says. */
 		if ((prot & PG_PROT) && is_data(addr, prot)) {
@@ -973,6 +1053,10 @@ long gmem_mprotect(uint64_t addr, uint64_t len, int prot)
 			ret = -GX_ENOMEM;
 		} else if (page_state[p] & PG_COPY) {
 			/* One protection cannot suit every view of the copy. */
+		} else if ((prot & PG_PROT) == WX_PROT && !(page_state[p] & PG_SHARED)) {
+			/* The host's protection follows when the page is touched:
+			 * see gmem_fault(). */
+			memset(&page_state[p], PG_USED | WX_PROT | (page_state[p] & PG_COMMITTED), q - p);
 		} else if (!(page_state[p] & PG_COMMITTED)) {
 			if (!(prot & PG_PROT))
 				;   /* reserved it was, reserved it stays */
@@ -1018,6 +1102,11 @@ long gmem_madvise(uint64_t addr, uint64_t len, int advice)
 			q++;
 		if (!(state & PG_COMMITTED) || (state & (PG_SHARED | PG_COPY))) {
 			/* nothing there, or not private */
+		} else if (is_wx(state)) {
+			/* Not to be written to from here: it may be executable. */
+			host_decommit(arena + p * GX_PAGE, (q - p) * GX_PAGE);
+			memset(&page_state[p], PG_USED | WX_PROT, q - p);
+			count_committed(-(int64_t)(q - p), 0);
 		} else if ((state & GX_PROT_WRITE) ||
 			   (!(state & PG_PROT) && is_data((uint64_t)arena + p * GX_PAGE, 0))) {
 			/* Cleared and kept, also what has no access (how
@@ -1044,7 +1133,7 @@ int gmem_accessible(uint64_t addr, uint64_t len, int write)
 	if (!in_arena(addr, len))
 		return 0;
 	for (uint64_t p = page_of(addr); p <= page_of(addr + len - 1); p++)
-		if ((page_state[p] & need) != need)
+		if ((page_state[p] & need) != need && !is_wx(page_state[p]))
 			return 0;
 	return 1;
 }

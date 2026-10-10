@@ -105,6 +105,10 @@ void gmem_set_brk(uint64_t start);
 long gmem_reserve_image(uint64_t span);
 int gmem_describe(uint64_t addr, uint64_t *base);
 void gmem_report(void);
+/* For the host to call when the guest's memory at addr refused an access (a
+ * jump to it if exec, a read or a write otherwise): returns whether the access
+ * is one to try again. See gmem.c on memory writable and executable. */
+int gmem_fault(uint64_t addr, int exec);
 
 /* gelf.c */
 struct gx_image {
