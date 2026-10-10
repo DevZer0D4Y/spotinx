@@ -191,7 +191,10 @@ if [ -e "$PC_OUT/chromium-full-switch.ext4" ] && [ -e "$PC_OUT/chromium-full.cmd
 	# next to itself the first time (profile.ext4, which is then the user's:
 	# nothing here replaces it).
 	[ ! -e "$PC_OUT/profile.ext4.gz" ] || cp "$PC_OUT/profile.ext4.gz" "$APP/profile.ext4.gz"
-	F="-w -b @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd")"
+	# -c3: the browser is told of the three processors it runs on. Told of
+	# one (what gx says by default) it decodes video on two threads and
+	# keeps its other pools as small.
+	F="-w -b -c3 @chromium-full.ext4 =profile.ext4 $(cat "$PC_OUT/chromium-full.cmd")"
 	echo "[Chromium, the whole browser (GPU)] $F --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist --disable-gpu-sandbox --in-process-gpu https://www.google.com/" >>"$APP/programs.txt"
 	echo "[Chromium, the whole browser (no GPU)] $F --disable-gpu https://www.google.com/" >>"$APP/programs.txt"
 fi
