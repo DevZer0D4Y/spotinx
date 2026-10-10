@@ -77,6 +77,7 @@ struct tcp_conn {
 	uint32_t buf_len;
 	int host_eof, fin_sent, fin_acked, guest_fin, dup_acks;
 	uint64_t timer;                    /* last progress, for retransmission */
+	uint64_t active;                   /* last time anything went either way */
 };
 
 struct udp_flow {
@@ -295,6 +296,30 @@ static struct tcp_conn *tcp_find(struct nat *nat, uint16_t gport, uint32_t remot
 	return NULL;
 }
 
+/* The host has no socket left to give (Horizon has a couple of dozen for a
+ * program): the connection nothing has gone through for longest is closed to
+ * make room, if it has been quiet for a while. A browser keeps connections
+ * open in case it needs them again and opens another when one is gone. */
+#define QUIET_MS 4000
+
+static int tcp_evict(struct nat *nat)
+{
+	struct tcp_conn *oldest = NULL;
+	uint64_t now = now_ms();
+
+	for (int i = 0; i < MAX_TCP; i++) {
+		struct tcp_conn *c = &nat->tcp[i];
+
+		if (c->state == T_OPEN && !c->buf_len && now - c->active >= QUIET_MS &&
+		    (!oldest || c->active < oldest->active))
+			oldest = c;
+	}
+	if (!oldest)
+		return 0;
+	tcp_reset(nat, oldest);
+	return 1;
+}
+
 static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t rport,
 		     uint32_t seq, uint32_t window)
 {
@@ -307,6 +332,8 @@ static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t 
 	if (c) {
 		c->buf = malloc(TCP_BUFFER);
 		c->fd = c->buf ? socket(AF_INET, SOCK_STREAM, 0) : -1;
+		if (c->buf && c->fd < 0 && tcp_evict(nat))
+			c->fd = socket(AF_INET, SOCK_STREAM, 0);
 	}
 	if (!c || c->fd < 0) {
 		/* No room for it now: nothing is answered, and the guest asks
@@ -330,7 +357,7 @@ static void tcp_open(struct nat *nat, uint16_t gport, uint32_t remote, uint16_t 
 	c->rport = rport;
 	c->rcv_nxt = seq + 1;
 	c->guest_window = window;
-	c->timer = now_ms();
+	c->timer = c->active = now_ms();
 	if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) && errno != EINPROGRESS) {
 		COMPLAIN("cannot connect to %u.%u.%u.%u:%u (error %d)\n", remote >> 24, remote >> 16 & 255,
 			 remote >> 8 & 255, remote & 255, rport, errno);
@@ -366,6 +393,7 @@ static void tcp_input(struct nat *nat, uint32_t remote, const uint8_t *tcp, size
 		tcp_free(c);
 		return;
 	}
+	c->active = now_ms();
 	if (flags & TH_SYN) {
 		/* Its SYN again: ours got lost, or the host is still connecting. */
 		if (c->state == T_SYNACK)
@@ -464,6 +492,7 @@ static void tcp_host_event(struct nat *nat, struct tcp_conn *c, int revents)
 		if (n > 0) {
 			if (!c->buf_len)
 				c->timer = now_ms();
+			c->active = now_ms();
 			c->buf_len += n;
 		} else if (n == 0) {
 			c->host_eof = 1;
@@ -546,6 +575,8 @@ static struct udp_flow *udp_flow(struct nat *nat, uint16_t gport)
 		close(f->fd);
 	}
 	f->fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (f->fd < 0 && tcp_evict(nat))
+		f->fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (f->fd < 0) {
 		COMPLAIN("no socket for UDP (error %d)\n", errno);
 		return NULL;

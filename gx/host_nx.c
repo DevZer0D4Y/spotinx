@@ -1298,9 +1298,30 @@ static int net_add(void)
 	static uint8_t mac[6];
 	int id;
 
-	if (R_FAILED(socketInitializeDefault())) {
-		host_log("gx: no sockets, no network\n");
-		return -1;
+	{
+		/* More room than libnx asks for by default: the system gives
+		 * out sockets from a store whose size comes from these numbers,
+		 * and a browser wants a hundred where the default gave about
+		 * twenty (ENOBUFS after that). Small buffers for each socket to
+		 * start with, which the NAT's own make up for, and a store
+		 * sized for large ones. */
+		SocketInitConfig config = *socketGetDefaultInitConfig();
+		Result rc;
+
+		config.tcp_tx_buf_size = 0x4000;
+		config.tcp_rx_buf_size = 0x8000;
+		config.tcp_tx_buf_max_size = 0x100000;
+		config.tcp_rx_buf_max_size = 0x100000;
+		config.sb_efficiency = 8;
+		rc = socketInitialize(&config);
+		if (R_FAILED(rc)) {
+			host_log("gx: no sockets with room for a browser (%#x): the usual ones\n", rc);
+			rc = socketInitializeDefault();
+		}
+		if (R_FAILED(rc)) {
+			host_log("gx: no sockets, no network\n");
+			return -1;
+		}
 	}
 	if (R_SUCCEEDED(nifmInitialize(NifmServiceType_User))) {
 		nifmGetCurrentIpConfigInfo(&addr, &mask, &gateway, &dns, &dns2);
