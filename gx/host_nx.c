@@ -434,20 +434,37 @@ static size_t pool_take(size_t n, size_t *first)
 				break;
 		}
 	}
-	for (int pass = 0; pass < 2; pass++) {
-		for (size_t p = pass ? 0 : pool_hint; p < pool_pages; p++) {
-			size_t run = 0;
+	/* A small piece: the lowest run that holds all of it. Taking whatever
+	 * came first, a page here and three there, made one mapping of every
+	 * crumb: a browser had 1300 of them after a while, two records each. */
+	while (pool_hint < pool_pages && pool_used[pool_hint])
+		pool_hint++;
+	for (size_t p = pool_hint; p + n <= pool_pages;) {
+		const uint8_t *used = memchr(&pool_used[p], 1, n);
 
-			if (pool_used[p])
-				continue;
-			while (run < n && p + run < pool_pages && !pool_used[p + run])
-				run++;
-			memset(&pool_used[p], 1, run);
-			pool_free -= run;
-			pool_hint = p + run;
+		if (!used) {
+			memset(&pool_used[p], 1, n);
+			pool_free -= n;
 			*first = p;
-			return run;
+			return n;
 		}
+		/* On to the next free page after what is in the way. */
+		p = used - pool_used + 1;
+		while (p < pool_pages && pool_used[p])
+			p++;
+	}
+	/* No such run: in pieces, lowest first. */
+	for (size_t p = pool_hint; p < pool_pages; p++) {
+		size_t run = 0;
+
+		if (pool_used[p])
+			continue;
+		while (run < n && p + run < pool_pages && !pool_used[p + run])
+			run++;
+		memset(&pool_used[p], 1, run);
+		pool_free -= run;
+		*first = p;
+		return run;
 	}
 	return 0;
 }

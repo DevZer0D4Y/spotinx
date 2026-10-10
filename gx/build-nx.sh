@@ -125,6 +125,10 @@ echo "== SD card"
 # runs Chromium; with DEV=1 the folder also gets programs.txt, a menu of what
 # to run, and the test programs build-pc.sh made.
 APP=$DIST/switch/chromium-nx
+# A log left there from the console is put aside first: all of this is made anew.
+for log in "$APP"/*.log; do
+	[ ! -e "$log" ] || mv "$log" "$SRC/../$(basename "$log")"
+done
 rm -rf "$DIST"
 mkdir -p "$APP"
 cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
