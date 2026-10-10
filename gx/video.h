@@ -19,6 +19,10 @@ struct gx_video_frame {
  * name is not one of them. For host_symbol(). */
 void *video_symbol(const char *name);
 
+/* Says in the log how many pictures were decoded since it was last asked, and
+ * how long each took: nothing if there were none. */
+void video_report(void);
+
 long gx_video_available(void);
 long gx_video_open(const uint8_t *extradata, long size);
 long gx_video_send(long handle, const uint8_t *data, long size, int64_t pts);

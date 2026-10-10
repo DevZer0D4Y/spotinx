@@ -54,10 +54,18 @@ static const char page_script[] =
 	 * more than H.264: a page that asks is told they cannot be played, and
 	 * serves H.264 instead (what the h264ify extension does). */
 	"var no=/vp8|vp9|vp09|av01/i;"
-	"function not(o,f){var g=o&&o[f];if(g)o[f]=function(t){return no.test(t)?(f=='canPlayType'?'':false)"
-	":g.apply(this,arguments)}}"
+	/* Nor anything taller than the screen: every picture is copied out of
+	 * the decoder and into the GPU, for nothing if it is then shrunk. */
+	"function tall(t){var m=/height=(\\d+)/.exec(t);return m&&+m[1]>720}"
+	"function not(o,f){var g=o&&o[f];if(g)o[f]=function(t){return no.test(t)||tall(t)?"
+	"(f=='canPlayType'?'':false):g.apply(this,arguments)}}"
 	"not(window.MediaSource,'isTypeSupported');not(window.ManagedMediaSource,'isTypeSupported');"
-	"not(HTMLMediaElement.prototype,'canPlayType')"
+	"not(HTMLMediaElement.prototype,'canPlayType');"
+	"var mc=navigator.mediaCapabilities,di=mc&&mc.decodingInfo;"
+	"if(di)mc.decodingInfo=function(c){var v=c&&c.video;"
+	"if(v&&(no.test(v.contentType)||v.height>720))"
+	"return Promise.resolve({supported:false,smooth:false,powerEfficient:false});"
+	"return di.apply(this,arguments)}"
 	"})()";
 static char session[128];   /* the page we are attached to, once we are */
 

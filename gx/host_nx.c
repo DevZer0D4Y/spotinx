@@ -2487,6 +2487,7 @@ static void watchdog(void *arg)
 		}
 		host_log("gx: after %d s\n", seconds);
 		bury_threads();
+		video_report();
 		gmem_report();
 		if (gl_swaps != swaps) {
 			host_log("gx: gl: %u pictures in 10 s\n", gl_swaps - swaps);

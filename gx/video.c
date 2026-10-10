@@ -36,6 +36,36 @@ struct decoder {
 
 static struct decoder decoders[MAX_DECODERS];
 static struct host_lock *lock;
+/* Where the time goes, for video_report(): pictures handed to the guest, and
+ * the time spent decoding them (waiting for the hardware included) and
+ * copying them out. */
+static uint64_t copied, decode_ns, copy_ns, slowest_decode_ns, slowest_copy_ns;
+
+static void complain(const char *what, int error)
+{
+	static int said;
+	char text[96] = "";
+
+	if (said < 12 && ++said) {
+		av_strerror(error, text, sizeof(text));
+		host_log("gx: video: %s: %s\n", what, text);
+	}
+}
+
+void video_report(void)
+{
+	static uint64_t last;
+	uint64_t count = copied - last;
+
+	if (!count)
+		return;
+	last = copied;
+	host_log("gx: video: %lu pictures; each %lu us to decode (%lu at most), %lu us to copy (%lu at most)\n",
+		 (unsigned long)count, (unsigned long)(decode_ns / count / 1000),
+		 (unsigned long)(slowest_decode_ns / 1000), (unsigned long)(copy_ns / count / 1000),
+		 (unsigned long)(slowest_copy_ns / 1000));
+	decode_ns = copy_ns = slowest_decode_ns = slowest_copy_ns = 0;
+}
 
 #ifdef __SWITCH__
 static enum AVPixelFormat pick_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
@@ -137,6 +167,7 @@ static void collect(struct decoder *d)
 long gx_video_send(long handle, const uint8_t *data, long size, int64_t pts)
 {
 	struct decoder *d = decoder_of(handle);
+	uint64_t start = host_now_ns(), took;
 	int ret;
 
 	if (!d)
@@ -162,6 +193,12 @@ long gx_video_send(long handle, const uint8_t *data, long size, int64_t pts)
 	}
 	av_packet_unref(d->packet);
 	collect(d);
+	took = host_now_ns() - start;
+	decode_ns += took;
+	if (took > slowest_decode_ns)
+		slowest_decode_ns = took;
+	if (ret < 0)
+		complain(ret == AVERROR(EAGAIN) ? "the decoder takes no more packets" : "a packet was refused", ret);
 	return ret < 0 && ret != AVERROR(EAGAIN) ? -1 : 0;
 }
 
@@ -203,15 +240,21 @@ long gx_video_copy(long handle, uint8_t *y, long y_stride, uint8_t *u, long u_st
 {
 	struct decoder *d = decoder_of(handle);
 	const AVFrame *frame = d ? d->current : NULL;
+	uint64_t start = host_now_ns(), took;
 	int width, height;
 
 	if (!frame)
 		return -1;
 	if (frame->hw_frames_ctx) {
 		/* Out of the decoder's memory first. */
+		int ret;
+
 		av_frame_unref(d->plain);
-		if (av_hwframe_transfer_data(d->plain, frame, 0) < 0)
+		ret = av_hwframe_transfer_data(d->plain, frame, 0);
+		if (ret < 0) {
+			complain("a picture could not be taken out of the decoder", ret);
 			return -1;
+		}
 		frame = d->plain;
 	}
 	width = frame->width;
@@ -235,8 +278,14 @@ long gx_video_copy(long handle, uint8_t *y, long y_stride, uint8_t *u, long u_st
 			memcpy(v + row * v_stride, frame->data[2] + row * frame->linesize[2], (width + 1) / 2);
 		}
 	} else {
+		complain("a picture is of a kind that is not handled", AVERROR(ENOSYS));
 		return -1;
 	}
+	took = host_now_ns() - start;
+	copy_ns += took;
+	if (took > slowest_copy_ns)
+		slowest_copy_ns = took;
+	copied++;
 	return 0;
 }
 
