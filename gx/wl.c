@@ -14,6 +14,7 @@
  * change nothing for a single full-screen window are read and dropped.
  */
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <lkl.h>
 #include "gx.h"
@@ -97,6 +98,37 @@ static int callback_count;
 static uint64_t last_frame;
 static int frames, counted;
 static uint64_t count_since, present_ns;
+
+/*
+ * Windows on top of the window: menus, the list under an address being typed.
+ * The client says where each goes relative to what it comes out of (a
+ * positioner), and draws it like the window; we keep its picture, put it over
+ * the window's, and give it the touches that land on it.
+ */
+#define MAX_POPUPS 8
+#define MAX_POSITIONERS 8
+
+struct positioner {
+	uint32_t id;
+	int32_t width, height;               /* of the popup */
+	int32_t x, y, w, h;                  /* what it is anchored to, in its parent */
+	uint32_t anchor, gravity;
+	int32_t dx, dy;
+};
+
+struct popup {
+	uint32_t id, surface, xdg;           /* id is 0 when the slot is free */
+	int32_t x, y;                        /* where its picture goes on the screen */
+	int32_t width, height;               /* of the picture, once there is one */
+	uint8_t *pixels;
+};
+
+static struct positioner positioners[MAX_POSITIONERS];
+static struct popup popups[MAX_POPUPS];   /* the later ones are on top */
+static uint32_t main_buffer;              /* the window's picture: kept until the next */
+static uint8_t *canvas;                   /* the screen when there are popups */
+static uint32_t touch_surface;            /* what the finger went down on */
+static int32_t touch_dx, touch_dy;
 
 /* The kernel's socket structures, which LKL's headers do not have. */
 struct wl_msghdr {
@@ -196,67 +228,205 @@ static void pool_unref(uint32_t index)
 		lkl_sys_close(pools[index].fd);
 }
 
-/* Shows the buffer a surface just committed, if it is the window's. */
-static void show(struct object *surface, uint32_t surface_id)
+/* The pixels of a buffer, if they are all there. */
+static uint8_t *buffer_pixels(uint32_t id)
 {
-	struct object *buffer = surface->pending < MAX_OBJECTS ? &objects[surface->pending] : NULL;
+	struct object *buffer = id && id < MAX_OBJECTS ? &objects[id] : NULL;
 	uint64_t size = 0;
 	uint8_t *memory;
 
+	if (!buffer || buffer->type != T_BUFFER || buffer->pool >= MAX_POOLS || !pools[buffer->pool].refs)
+		return NULL;
+	memory = gmem_shared_peek(pools[buffer->pool].fd, &size);
+	if (!memory || buffer->width <= 0 || buffer->height <= 0 || buffer->offset < 0 ||
+	    (uint64_t)buffer->offset + (uint64_t)buffer->stride * buffer->height > size)
+		return NULL;
+	return memory + buffer->offset;
+}
+
+static struct popup *popup_of(uint32_t surface)
+{
+	for (int i = 0; i < MAX_POPUPS; i++)
+		if (popups[i].id && popups[i].surface == surface)
+			return &popups[i];
+	return NULL;
+}
+
+/* Puts the screen together and shows it: the window, and the popups over it
+ * in the order they came. Their pixels come with their colours already
+ * multiplied by their opacity, which is how they are laid over. */
+static void compose(void)
+{
+	struct object *buffer = &objects[main_buffer < MAX_OBJECTS ? main_buffer : 0];
+	uint8_t *window = buffer_pixels(main_buffer);
+	uint64_t start = host_now_ns(), took;
+	int covered = 0;
+
+	if (!window)
+		return;
+	for (int i = 0; i < MAX_POPUPS; i++)
+		covered |= popups[i].id && popups[i].pixels;
+	if (covered && !canvas)
+		canvas = malloc(WL_SCREEN_WIDTH * WL_SCREEN_HEIGHT * 4);
+	if (!covered || !canvas || buffer->width != WL_SCREEN_WIDTH || buffer->height != WL_SCREEN_HEIGHT) {
+		host_present(window, buffer->width, buffer->height, buffer->stride);
+	} else {
+		for (int y = 0; y < WL_SCREEN_HEIGHT; y++)
+			memcpy(canvas + (size_t)y * WL_SCREEN_WIDTH * 4, window + (size_t)y * buffer->stride,
+			       WL_SCREEN_WIDTH * 4);
+		for (int i = 0; i < MAX_POPUPS; i++) {
+			const struct popup *p = &popups[i];
+
+			if (!p->id || !p->pixels)
+				continue;
+			for (int y = 0; y < p->height; y++) {
+				const uint8_t *src = p->pixels + (size_t)y * p->width * 4;
+				int sy = p->y + y;
+
+				if (sy < 0 || sy >= WL_SCREEN_HEIGHT)
+					continue;
+				for (int x = 0; x < p->width; x++, src += 4) {
+					int sx = p->x + x;
+					uint8_t *dst;
+					unsigned keep = 255 - src[3];
+
+					if (sx < 0 || sx >= WL_SCREEN_WIDTH || !src[3])
+						continue;
+					dst = canvas + ((size_t)sy * WL_SCREEN_WIDTH + sx) * 4;
+					if (!keep) {
+						memcpy(dst, src, 4);
+						continue;
+					}
+					for (int c = 0; c < 3; c++)
+						dst[c] = src[c] + dst[c] * keep / 255;
+				}
+			}
+		}
+		host_present(canvas, WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, WL_SCREEN_WIDTH * 4);
+	}
+	took = host_now_ns() - start;
+	if (!frames++ || gx_trace)
+		host_log("gx: wayland: picture %d, %dx%d\n", frames, buffer->width, buffer->height);
+	/* How smooth it is, every five seconds something was shown. */
+	if (!count_since)
+		count_since = start;
+	counted++;
+	present_ns += took;
+	if (start - count_since >= 5000000000ULL) {
+		host_log("gx: wayland: %d pictures in %lu ms, %lu ms each to show\n", counted,
+			 (unsigned long)((start - count_since) / 1000000),
+			 (unsigned long)(present_ns / counted / 1000000));
+		count_since = start;
+		counted = 0;
+		present_ns = 0;
+	}
+}
+
+/* Shows the buffer a surface just committed, if it is the window's or a
+ * popup's. The window's buffer stays ours until its next one: a popup that
+ * comes or goes needs the window drawn again under it. A popup's is copied. */
+static void show(struct object *surface, uint32_t surface_id)
+{
+	struct popup *p = popup_of(surface_id);
+	struct object *buffer = surface->pending < MAX_OBJECTS ? &objects[surface->pending] : NULL;
+
 	if (!buffer || buffer->type != T_BUFFER)
 		return;
-	if (surface_id == main_surface && buffer->pool < MAX_POOLS && pools[buffer->pool].refs) {
-		memory = gmem_shared_peek(pools[buffer->pool].fd, &size);
-		if (memory && buffer->width > 0 && buffer->height > 0 && buffer->offset >= 0 &&
-		    (uint64_t)buffer->offset + (uint64_t)buffer->stride * buffer->height <= size) {
-			uint64_t start = host_now_ns(), took;
+	if (surface_id == main_surface) {
+		if (main_buffer && main_buffer != surface->pending)
+			event(main_buffer, 0, "");   /* wl_buffer.release */
+		main_buffer = surface->pending;
+		compose();
+		return;
+	}
+	if (p) {
+		const uint8_t *pixels = buffer_pixels(surface->pending);
+		struct object *xdg = &objects[p->xdg < MAX_OBJECTS ? p->xdg : 0];
 
-			host_present(memory + buffer->offset, buffer->width, buffer->height, buffer->stride);
-			took = host_now_ns() - start;
-			if (!frames++ || gx_trace)
-				host_log("gx: wayland: picture %d, %dx%d\n", frames, buffer->width,
-					 buffer->height);
-			/* How smooth it is, every five seconds something was shown. */
-			if (!count_since)
-				count_since = start;
-			counted++;
-			present_ns += took;
-			if (start - count_since >= 5000000000ULL) {
-				host_log("gx: wayland: %d pictures in %lu ms, %lu ms each to show\n", counted,
-					 (unsigned long)((start - count_since) / 1000000),
-					 (unsigned long)(present_ns / counted / 1000000));
-				count_since = start;
-				counted = 0;
-				present_ns = 0;
+		if (pixels && buffer->width <= 4096 && buffer->height <= 4096) {
+			if (!p->pixels || p->width != buffer->width || p->height != buffer->height) {
+				free(p->pixels);
+				p->pixels = malloc((size_t)buffer->width * buffer->height * 4);
+				p->width = buffer->width;
+				p->height = buffer->height;
 			}
+			for (int y = 0; p->pixels && y < p->height; y++)
+				memcpy(p->pixels + (size_t)y * p->width * 4,
+				       pixels + (size_t)y * buffer->stride, p->width * 4);
+			(void)xdg;
+			compose();
 		}
 	}
 	/* We keep nothing of it: the client may draw in it again. */
 	event(surface->pending, 0, "");   /* wl_buffer.release */
 }
 
+static void popup_gone(struct popup *p)
+{
+	free(p->pixels);
+	memset(p, 0, sizeof(*p));
+	compose();
+}
+
+/* Where a popup goes: the point of its anchor the positioner names, then the
+ * side of that point it is to be on, kept on the screen. (x, y) is where the
+ * parent's own (0, 0) is on the screen. */
+static void place_popup(const struct positioner *q, int32_t x, int32_t y, int32_t *px, int32_t *py)
+{
+	static const int8_t side[9][2] = {
+		{ 0, 0 }, { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 }, { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 },
+	};
+	const int8_t *a = side[q->anchor < 9 ? q->anchor : 0], *g = side[q->gravity < 9 ? q->gravity : 0];
+
+	x += q->x + (a[0] < 0 ? 0 : a[0] > 0 ? q->w : q->w / 2) + q->dx;
+	y += q->y + (a[1] < 0 ? 0 : a[1] > 0 ? q->h : q->h / 2) + q->dy;
+	x -= g[0] < 0 ? q->width : g[0] > 0 ? 0 : q->width / 2;
+	y -= g[1] < 0 ? q->height : g[1] > 0 ? 0 : q->height / 2;
+	if (x + q->width > WL_SCREEN_WIDTH)
+		x = WL_SCREEN_WIDTH - q->width;
+	if (y + q->height > WL_SCREEN_HEIGHT)
+		y = WL_SCREEN_HEIGHT - q->height;
+	*px = x < 0 ? 0 : x;
+	*py = y < 0 ? 0 : y;
+}
+
 static void keyboard_focus(void);
+
+/* The window is the screen, whatever it asks to be: maximized (1), which is
+ * what makes a browser drop the margin it draws its shadow in, and active
+ * (4); full-screen (2) when it asks for that, which is a page that wants the
+ * whole screen for a video. */
+static void configure_window(struct object *surface, int full_screen)
+{
+	static const uint32_t states[] = { 1, 4, 2 };
+
+	event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, states, full_screen ? 3 : 2);
+	event(surface->xdg, 0, "u", serial++);   /* xdg_surface.configure */
+}
 
 static void commit(uint32_t id)
 {
 	struct object *surface = &objects[id];
 
 	if (surface->toplevel && !surface->configured) {
-		/* The window is the screen: full-screen (2) and active (4). */
-		static const uint32_t states[] = { 2, 4 };
-
 		surface->configured = 1;
 		main_surface = id;
-		event(surface->toplevel, 0, "iia", WL_SCREEN_WIDTH, WL_SCREEN_HEIGHT, states, 2);
-		event(surface->xdg, 0, "u", serial++);   /* xdg_surface.configure */
+		configure_window(surface, 0);
 		if (output_id)
 			event(id, 0, "u", output_id);    /* wl_surface.enter */
 		keyboard_focus();
 	}
 	if (surface->attached) {
+		struct popup *p = popup_of(id);
+
 		surface->attached = 0;
-		if (surface->pending)
+		if (surface->pending) {
 			show(surface, id);
+		} else if (p && p->pixels) {
+			free(p->pixels);
+			p->pixels = NULL;
+			compose();
+		}
 		surface->pending = 0;
 	}
 }
@@ -418,6 +588,8 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		break;
 	case T_BUFFER:
 		if (opcode == 0) {
+			if (id == main_buffer)
+				main_buffer = 0;
 			pool_unref(o->pool);
 			delete_id(id);
 		}
@@ -426,6 +598,8 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		if (opcode == 0) {            /* destroy */
 			if (id == main_surface)
 				main_surface = 0;
+			if (popup_of(id))
+				popup_gone(popup_of(id));
 			delete_id(id);
 		} else if (opcode == 1) {     /* attach */
 			o->pending = w[0];
@@ -478,7 +652,12 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 		if (opcode == 0) {
 			delete_id(id);
 		} else if (opcode == 1) {
+			static int next;
+
 			create(w[0], T_POSITIONER, 1);
+			memset(&positioners[next], 0, sizeof(positioners[next]));
+			positioners[next].id = w[0];
+			next = (next + 1) % MAX_POSITIONERS;
 		} else if (opcode == 2) {     /* get_xdg_surface */
 			create(w[0], T_XDG_SURFACE, o->version)->surface = w[1];
 			if (w[1] < MAX_OBJECTS)
@@ -492,10 +671,44 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 			create(w[0], T_TOPLEVEL, o->version)->surface = o->surface;
 			if (o->surface < MAX_OBJECTS)
 				objects[o->surface].toplevel = w[0];
-		} else if (opcode == 2) {     /* get_popup: shown nowhere yet, but answered */
-			create(w[0], T_POPUP, o->version);
-			event(w[0], 0, "iiii", 0, 0, 1, 1);
+		} else if (opcode == 2) {     /* get_popup(new id, parent, positioner) */
+			struct object *parent = &objects[w[1] < MAX_OBJECTS ? w[1] : 0];
+			struct popup *above = popup_of(parent->surface), *p = NULL;
+			const struct positioner *q = NULL;
+			/* Where the parent's own (0, 0) is on the screen: a window's
+			 * is where its frame starts in its picture. */
+			int32_t x0 = above ? above->x + parent->offset : parent->offset;
+			int32_t y0 = above ? above->y + parent->stride : parent->stride;
+			int32_t x = 0, y = 0;
+
+			create(w[0], T_POPUP, o->version)->surface = o->surface;
+			for (int i = 0; i < MAX_POSITIONERS; i++)
+				if (positioners[i].id == w[2])
+					q = &positioners[i];
+			for (int i = 0; i < MAX_POPUPS && !p; i++)
+				if (!popups[i].id)
+					p = &popups[i];
+			if (q && p) {
+				place_popup(q, x0, y0, &x, &y);
+				p->id = w[0];
+				p->surface = o->surface;
+				p->xdg = id;
+				/* Its picture has a frame of its own around what
+				 * the positioner speaks of. */
+				p->x = x - o->offset;
+				p->y = y - o->stride;
+			}
+			event(w[0], 0, "iiii", x - x0, y - y0, q ? q->width : 1, q ? q->height : 1);
 			event(id, 0, "u", serial++);
+		} else if (opcode == 3) {     /* set_window_geometry: the frame in the picture */
+			struct popup *p = popup_of(o->surface);
+
+			if (p) {
+				p->x += o->offset - (int32_t)w[0];
+				p->y += o->stride - (int32_t)w[1];
+			}
+			o->offset = w[0];
+			o->stride = w[1];
 		}
 		break;
 	case T_TOUCH:
@@ -511,11 +724,53 @@ static void request(uint32_t id, uint16_t opcode, const uint32_t *w, uint32_t wo
 			delete_id(id);
 		}
 		break;
+	case T_POSITIONER:
+		for (int i = 0; i < MAX_POSITIONERS; i++) {
+			struct positioner *q = &positioners[i];
+
+			if (q->id != id)
+				continue;
+			if (opcode == 0) {
+				q->id = 0;
+			} else if (opcode == 1) {
+				q->width = w[0];
+				q->height = w[1];
+			} else if (opcode == 2) {
+				q->x = w[0];
+				q->y = w[1];
+				q->w = w[2];
+				q->h = w[3];
+			} else if (opcode == 3) {
+				q->anchor = w[0];
+			} else if (opcode == 4) {
+				q->gravity = w[0];
+			} else if (opcode == 6) {
+				q->dx = w[0];
+				q->dy = w[1];
+			}
+		}
+		if (opcode == 0)
+			delete_id(id);
+		break;
+	case T_POPUP:
+		if (opcode == 0) {
+			if (popup_of(o->surface) && popup_of(o->surface)->id == id)
+				popup_gone(popup_of(o->surface));
+			delete_id(id);
+		}
+		break;
+	case T_TOPLEVEL:
+		if (opcode == 0) {
+			delete_id(id);
+		} else if (opcode >= 9 && opcode <= 12 && o->surface < MAX_OBJECTS &&
+			   objects[o->surface].configured) {
+			/* set and unset maximized, set and unset full-screen: it
+			 * is told what it is, which it waits for. */
+			configure_window(&objects[o->surface], opcode == 11);
+		}
+		break;
 	case T_REGION:
 	case T_SUBSURFACE:
-	case T_POSITIONER:
-	case T_TOPLEVEL:
-	case T_POPUP:
 		if (opcode == 0)
 			delete_id(id);
 		break;
@@ -657,14 +912,28 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		return;
 	switch (in->type) {
 	case CDP_TOUCH_DOWN:
+		/* On the popup that is there, the topmost one, or on the window. */
+		touch_surface = main_surface;
+		touch_dx = touch_dy = 0;
+		for (int i = 0; i < MAX_POPUPS; i++) {
+			const struct popup *p = &popups[i];
+
+			if (p->id && p->pixels && in->x >= p->x && in->x < p->x + p->width &&
+			    in->y >= p->y && in->y < p->y + p->height) {
+				touch_surface = p->surface;
+				touch_dx = p->x;
+				touch_dy = p->y;
+			}
+		}
 		if (touch_id) {
-			event(touch_id, 0, "uuuiff", serial++, ms, main_surface, 0, in->x, in->y);
+			event(touch_id, 0, "uuuiff", serial++, ms, touch_surface, 0, in->x - touch_dx,
+			      in->y - touch_dy);
 			event(touch_id, 3, "");   /* frame */
 		}
 		break;
 	case CDP_TOUCH_MOVE:
 		if (touch_id) {
-			event(touch_id, 2, "uiff", ms, 0, in->x, in->y);
+			event(touch_id, 2, "uiff", ms, 0, in->x - touch_dx, in->y - touch_dy);
 			event(touch_id, 3, "");
 		}
 		break;

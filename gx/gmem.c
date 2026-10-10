@@ -816,6 +816,15 @@ static long map_shared(uint64_t len, int prot, int fd, uint64_t off)
 
 	if (lkl_sys_fstat(fd, &st) || (st.st_mode & LKL_S_IFMT) != LKL_S_IFREG)
 		return 0;
+	/* A view is a copy of the file, and what write() puts in the file later
+	 * does not show in it. Whoever maps a file it can write, in a view it
+	 * cannot write through, means to see those writes (SQLite does, with
+	 * its databases): better no view than one that lies, and such programs
+	 * read the file instead when there is none. A file without a name is
+	 * shared memory, which nobody writes to with write(). */
+	if (!(prot & GX_PROT_WRITE) && st.st_nlink > 0 &&
+	    (lkl_sys_fcntl(fd, LKL_F_GETFL, 0) & LKL_O_ACCMODE) == LKL_O_RDWR)
+		return -19;   /* ENODEV */
 	for (int i = 0; i < MAX_VIEWS && !v; i++)
 		if (!views[i].pages)
 			v = &views[i];
