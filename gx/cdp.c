@@ -49,7 +49,15 @@ static const char page_script[] =
 	"window.__gxText=function(){var a=document.activeElement;"
 	"while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return ed(a)};"
 	"document.addEventListener('click',function(v){"
-	"if(v.isTrusted&&v.pointerType=='touch'&&window.__gxText()&&window.gxEdit)gxEdit('touch')},true)"
+	"if(v.isTrusted&&v.pointerType=='touch'&&window.__gxText()&&window.gxEdit)gxEdit('touch')},true);"
+	/* Video is decoded by the processor here, and VP9 and AV1 cost it far
+	 * more than H.264: a page that asks is told they cannot be played, and
+	 * serves H.264 instead (what the h264ify extension does). */
+	"var no=/vp8|vp9|vp09|av01/i;"
+	"function not(o,f){var g=o&&o[f];if(g)o[f]=function(t){return no.test(t)?(f=='canPlayType'?'':false)"
+	":g.apply(this,arguments)}}"
+	"not(window.MediaSource,'isTypeSupported');not(window.ManagedMediaSource,'isTypeSupported');"
+	"not(HTMLMediaElement.prototype,'canPlayType')"
 	"})()";
 static char session[128];   /* the page we are attached to, once we are */
 
@@ -133,7 +141,7 @@ static void send_text(const char *text, size_t len)
 /* Sends a command to a session, or to the browser itself if to is "". */
 static void send_command(const char *to, const char *method, const char *params)
 {
-	char text[3400];
+	char text[5000];
 	int n;
 
 	if (to[0])
@@ -253,7 +261,7 @@ static void handle_window_message(const char *message)
 	char id[128];
 
 	if (strstr(message, "\"method\":\"Target.attachedToTarget\"")) {
-		char script[2048], params[2200];
+		char script[4096], params[4300];
 		int slot = -1;
 
 		if (!strstr(message, "\"type\":\"page\"") ||
