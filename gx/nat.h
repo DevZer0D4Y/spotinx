@@ -18,6 +18,6 @@ struct lkl_netdev;
 
 /* dns is the resolver of the host, as an IPv4 address in network byte order.
  * mac receives the address to give the device (lkl_netdev_args). */
-struct lkl_netdev *nat_create(uint32_t dns, uint8_t mac[6]);
+struct lkl_netdev *nat_create(uint32_t dns, uint32_t dns2, uint8_t mac[6]);
 
 #endif

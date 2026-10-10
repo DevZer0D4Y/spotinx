@@ -83,6 +83,13 @@ struct udp_flow {
 	int fd;                            /* -1 when free */
 	uint16_t gport;
 	uint64_t used;
+	/* A question to the resolver that has no answer yet: asked again
+	 * here, sooner than the guest would, since one lost datagram is a
+	 * page that does not load. */
+	uint8_t question[512];
+	uint16_t question_len, question_port;
+	uint8_t asked;                     /* times: 0 when there is none waiting */
+	uint64_t asked_at, first_asked;
 };
 
 struct frame {
@@ -97,7 +104,7 @@ struct nat {
 	int head, count;
 	int wake_fd;                       /* a UDP socket connected to itself */
 	int closing;
-	uint32_t dns;                      /* host byte order */
+	uint32_t dns, dns2;                /* host byte order; dns2 may be 0 */
 	uint16_t ip_id;
 	struct tcp_conn tcp[MAX_TCP];
 	struct udp_flow udp[MAX_UDP];
@@ -468,6 +475,34 @@ static void tcp_host_event(struct nat *nat, struct tcp_conn *c, int revents)
 	}
 }
 
+/* Questions to the resolver that have waited a while are asked again. */
+static void udp_timers(struct nat *nat, uint64_t now)
+{
+	for (int i = 0; i < MAX_UDP; i++) {
+		struct udp_flow *f = &nat->udp[i];
+		struct sockaddr_in sa = { 0 };
+
+		if (f->fd < 0 || !f->asked || now - f->asked_at < (f->asked == 1 ? 300 : 1000))
+			continue;
+		if (f->asked >= 5) {
+			COMPLAIN("a name got no answer in %u ms\n", (unsigned)(now - f->first_asked));
+			f->asked = 0;
+			continue;
+		}
+		f->asked++;
+		f->asked_at = now;
+		sa.sin_family = AF_INET;
+		sa.sin_port = htons(f->question_port);
+		sa.sin_addr.s_addr = htonl(nat->dns);
+		sendto(f->fd, f->question, f->question_len, MSG_NOSIGNAL, (struct sockaddr *)&sa, sizeof(sa));
+		if (nat->dns2) {
+			sa.sin_addr.s_addr = htonl(nat->dns2);
+			sendto(f->fd, f->question, f->question_len, MSG_NOSIGNAL, (struct sockaddr *)&sa,
+			       sizeof(sa));
+		}
+	}
+}
+
 static void tcp_timers(struct nat *nat, uint64_t now)
 {
 	for (int i = 0; i < MAX_TCP; i++) {
@@ -531,12 +566,28 @@ static void udp_input(struct nat *nat, uint32_t remote, const uint8_t *udp, size
 	if (!f)
 		return;
 	f->used = now_ms();
-	if (remote == NAT_DNS)
-		remote = nat->dns;
-	else if (remote == NAT_GATEWAY)
-		remote = INADDR_LOOPBACK;
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons(get16(udp + 2));
+	if (remote == NAT_DNS) {
+		size_t size = get16(udp + 4) - 8;
+
+		/* To both resolvers of the host, and kept to ask again. */
+		f->asked = 0;
+		if (size <= sizeof(f->question)) {
+			memcpy(f->question, udp + 8, size);
+			f->question_len = size;
+			f->question_port = get16(udp + 2);
+			f->asked = 1;
+			f->asked_at = f->first_asked = f->used;
+		}
+		if (nat->dns2) {
+			sa.sin_addr.s_addr = htonl(nat->dns2);
+			sendto(f->fd, udp + 8, size, MSG_NOSIGNAL, (struct sockaddr *)&sa, sizeof(sa));
+		}
+		remote = nat->dns;
+	} else if (remote == NAT_GATEWAY) {
+		remote = INADDR_LOOPBACK;
+	}
 	sa.sin_addr.s_addr = htonl(remote);
 	sendto(f->fd, udp + 8, get16(udp + 4) - 8, MSG_NOSIGNAL, (struct sockaddr *)&sa, sizeof(sa));
 }
@@ -558,8 +609,19 @@ static void udp_host_event(struct nat *nat, struct udp_flow *f)
 		if (n < 0)
 			return;
 		remote = ntohl(sa.sin_addr.s_addr);
-		if (remote == nat->dns && ntohs(sa.sin_port) == 53)
+		if ((remote == nat->dns || (nat->dns2 && remote == nat->dns2)) && ntohs(sa.sin_port) == 53) {
 			remote = NAT_DNS;
+			if (f->asked) {
+				uint64_t took = now_ms() - f->first_asked;
+
+				if (took > 700)
+					COMPLAIN("a name took %u ms to resolve (asked %d times)\n",
+						 (unsigned)took, f->asked);
+				f->asked = 0;
+			} else if (ntohs(sa.sin_port) == 53) {
+				continue;   /* the other resolver's answer to the same question */
+			}
+		}
 		else if (remote == INADDR_LOOPBACK)
 			remote = NAT_GATEWAY;
 		put16(udp, ntohs(sa.sin_port));
@@ -674,6 +736,7 @@ static int nat_poll(struct lkl_netdev *nd)
 			return LKL_DEV_NET_POLL_HUP;
 		}
 		tcp_timers(nat, now);
+		udp_timers(nat, now);
 		if (nat->count) {
 			pthread_mutex_unlock(&nat->lock);
 			return LKL_DEV_NET_POLL_RX;
@@ -796,7 +859,7 @@ static int wake_socket(void)
 	return fd;
 }
 
-struct lkl_netdev *nat_create(uint32_t dns, uint8_t mac[6])
+struct lkl_netdev *nat_create(uint32_t dns, uint32_t dns2, uint8_t mac[6])
 {
 	struct nat *nat = calloc(1, sizeof(*nat));
 
@@ -810,6 +873,7 @@ struct lkl_netdev *nat_create(uint32_t dns, uint8_t mac[6])
 	pthread_mutex_init(&nat->lock, NULL);
 	nat->dev.ops = &nat_ops;
 	nat->dns = ntohl(dns);
+	nat->dns2 = dns2 == dns ? 0 : ntohl(dns2);
 	nat->wake_fd = wake_socket();
 	for (int i = 0; i < MAX_TCP; i++)
 		nat->tcp[i].fd = -1;

@@ -1308,11 +1308,12 @@ static int net_add(void)
 	}
 	if (!dns)
 		dns = inet_addr("1.1.1.1");
-	nd = nat_create(dns, mac);
+	nd = nat_create(dns, dns2, mac);
 	memset(&args, 0, sizeof(args));
 	args.mac = mac;
 	id = nd ? lkl_netdev_add(nd, &args) : -1;
-	host_log("gx: network device %d, resolver %s\n", id, inet_ntoa((struct in_addr){ dns }));
+	host_log("gx: network device %d, resolver %s", id, inet_ntoa((struct in_addr){ dns }));
+	host_log(" and %s\n", dns2 ? inet_ntoa((struct in_addr){ dns2 }) : "no other");
 	return id;
 }
 

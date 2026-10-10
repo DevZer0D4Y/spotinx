@@ -897,7 +897,7 @@ static uint32_t host_resolver(void)
 static int net_add(void)
 {
 	uint8_t mac[6];
-	struct lkl_netdev *nd = nat_create(host_resolver(), mac);
+	struct lkl_netdev *nd = nat_create(host_resolver(), 0, mac);
 	struct lkl_netdev_args args = { .mac = mac };
 	int id = nd ? lkl_netdev_add(nd, &args) : -1;
 
