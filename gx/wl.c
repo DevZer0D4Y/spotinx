@@ -898,10 +898,19 @@ static void type_text(const char *text, uint32_t ms)
 	}
 }
 
-/* Where the window of chromium-shell has its address, right of its buttons. */
-#define ADDRESS_LEFT 296
-#define ADDRESS_BOTTOM 42
+/* Where the window has its address: chromium-shell's, right of its buttons,
+ * unless the host says otherwise (wl_address_bar()). */
 #define ADDRESS_FOCUS_NS 200000000ULL
+
+static int address_left = 296, address_top, address_right = WL_SCREEN_WIDTH, address_bottom = 42;
+
+void wl_address_bar(int left, int top, int right, int bottom)
+{
+	address_left = left;
+	address_top = top;
+	address_right = right;
+	address_bottom = bottom;
+}
 
 static uint64_t address_touched;
 static int edit_is_address;
@@ -946,7 +955,8 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		 * made the address what keys go to. The page says when its own
 		 * text is touched (cdp.c); the window's has no one to say it,
 		 * but is always in the same place. */
-		if (in->y < ADDRESS_BOTTOM && in->x >= ADDRESS_LEFT)
+		if (touch_surface == main_surface && in->y >= address_top && in->y < address_bottom &&
+		    in->x >= address_left && in->x < address_right)
 			address_touched = host_now_ns();
 		break;
 	case CDP_BACK:
@@ -983,7 +993,7 @@ static void input(const struct cdp_input *in, uint32_t ms)
 		 * address, reached the way a finger reaches it. */
 		if (touch_id) {
 			event(touch_id, 0, "uuuiff", serial++, ms, main_surface, 0,
-			      (ADDRESS_LEFT + WL_SCREEN_WIDTH) / 2, ADDRESS_BOTTOM / 2);
+			      (address_left + address_right) / 2, (address_top + address_bottom) / 2);
 			event(touch_id, 3, "");
 			event(touch_id, 1, "uui", serial++, ms, 0);
 			event(touch_id, 3, "");

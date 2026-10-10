@@ -2304,6 +2304,12 @@ int main(int argc, char **argv)
 			browser = 1;
 		else if (!guest_argc && !strcmp(word, "-w"))
 			wayland = 1;
+		else if (!guest_argc && !strncmp(word, "-A", 2)) {
+			int l, t, r, b;   /* -A<left>,<top>,<right>,<bottom>: the address bar */
+
+			if (sscanf(word + 2, "%d,%d,%d,%d", &l, &t, &r, &b) == 4)
+				wl_address_bar(l, t, r, b);
+		}
 		else if (!guest_argc && !strncmp(word, "-c", 2) && word[2])
 			cpu_count = atoi(word + 2);
 		else if (!guest_argc && word[0] == '@')

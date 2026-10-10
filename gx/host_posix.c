@@ -973,6 +973,12 @@ int main(int argc, char **argv)
 			browser = 1;
 		else if (!strcmp(argv[arg], "-w"))
 			wayland = 1;
+		else if (!strcmp(argv[arg], "-A") && arg + 1 < argc) {
+			int l, t, r, b;
+
+			if (sscanf(argv[++arg], "%d,%d,%d,%d", &l, &t, &r, &b) == 4)
+				wl_address_bar(l, t, r, b);
+		}
 		else if (!strcmp(argv[arg], "-e") && arg + 1 < argc && env_count < 31)
 			guest_env[env_count++] = argv[++arg];
 		else if (!strcmp(argv[arg], "-c") && arg + 1 < argc)

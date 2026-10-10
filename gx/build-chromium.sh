@@ -24,6 +24,16 @@ CHROMIUM=/usr/lib/chromium/chromium-headless-shell
 
 [ -x $CHROMIUM ] || { echo "no arm64 chromium-headless-shell in this container"; exit 1; }
 
+# What the whole browser is started with, here and on the console: one process,
+# no helper of its own to report crashes (it would be a process), its profile
+# in /root, and a cache that stays small since the files are in memory.
+FULL_FLAGS="--no-sandbox --single-process --no-zygote --ozone-platform=wayland --user-data-dir=/root/profile \
+--no-first-run --no-default-browser-check --disable-breakpad --disable-crashpad-for-testing --test-type \
+--password-store=basic --disable-background-networking --disable-component-update \
+--disk-cache-size=33554432 --media-cache-size=33554432"
+# Where its address bar is, for gx (-A).
+FULL_ADDRESS=225,46,1150,80
+
 if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; then
 	echo "== root filesystem"
 	rm -rf "$ROOT"
@@ -38,8 +48,12 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 	# (the "wayland" mode below wants it).
 	SHELL_BIN=/usr/lib/chromium/chromium-shell
 	[ -x $SHELL_BIN ] || SHELL_BIN=
+	# And chromium itself, the whole browser (the "full" mode below).
+	FULL_BIN=/usr/lib/chromium/chromium
+	[ -x $FULL_BIN ] || FULL_BIN=
 	for lib in $($QEMU $ARM64_LD --list $CHROMIUM | awk '$2 == "=>" { print $3 }') \
 		$([ -z "$SHELL_BIN" ] || $QEMU $ARM64_LD --list $SHELL_BIN | awk '$2 == "=>" { print $3 }') \
+		$([ -z "$FULL_BIN" ] || $QEMU $ARM64_LD --list $FULL_BIN | awk '$2 == "=>" { print $3 }') \
 		$ARM64_LIB/libsoftokn3.so $ARM64_LIB/libfreebl3.so $ARM64_LIB/libfreeblpriv3.so \
 		$ARM64_LIB/libnssckbi.so $ARM64_LIB/libnssdbm3.so $ARM64_LIB/libsqlite3.so.0 \
 		$ARM64_LIB/libnss_*.so.2 $ARM64_LIB/libgcc_s.so.1; do
@@ -60,7 +74,7 @@ if [ ! -e "$IMAGE" ] || [ "$0" -nt "$IMAGE" ] || [ $CHROMIUM -nt "$IMAGE" ]; the
 	CC=aarch64-linux-gnu-gcc
 	A=$OUT/asound
 	mkdir -p "$A"
-	for bin in $CHROMIUM $SHELL_BIN; do
+	for bin in $CHROMIUM $SHELL_BIN $FULL_BIN; do
 		aarch64-linux-gnu-readelf --dyn-syms -W "$bin"
 	done | awk '$7 == "UND" && $8 ~ /^snd_/ { sub(/ \([0-9]+\)$/, ""); print $8 }' | sort -u >"$A/imports"
 	echo 'GX_THUNK(gx_audio_open) GX_THUNK(gx_audio_write) GX_THUNK(gx_audio_queued)
@@ -121,10 +135,37 @@ EOF
 	mke2fs -q -t ext4 -O ^has_journal -d "$SLIM" "$OUT/chromium-switch.ext4" "${size}M" || exit 1
 	rm -rf "$SLIM"
 	echo "$OUT/chromium-switch.ext4: ${size} MB"
+	# And one with the whole browser in place of chromium-shell.
+	if [ -n "$FULL_BIN" ]; then
+		cp -al "$ROOT" "$SLIM" || exit 1
+		rm -f "$SLIM"/usr/lib/chromium/{chromium-headless-shell,chromium-shell,chrome_crashpad_handler} \
+			"$SLIM"/usr/lib/chromium/{libvk_swiftshader.so,vk_swiftshader_icd.json,libvulkan.so.1} \
+			"$SLIM"/usr/lib/chromium/{libVkLayer_khronos_validation.so,libtest_trace_processor.so} \
+			"$SLIM"/usr/lib/chromium/*.log
+		size=$(( $(du -sm "$SLIM" | cut -f1) * 21 / 20 + 16 ))
+		rm -f "$OUT/chromium-full-switch.ext4"
+		mke2fs -q -t ext4 -O ^has_journal -d "$SLIM" "$OUT/chromium-full-switch.ext4" "${size}M" || exit 1
+		rm -rf "$SLIM"
+		echo "$OUT/chromium-full-switch.ext4: ${size} MB"
+		# How to start it, for build-nx.sh to put in the console's menu.
+		echo "-A$FULL_ADDRESS /usr/lib/chromium/chromium $FULL_FLAGS" >"$OUT/chromium-full.cmd"
+	fi
 fi
 
 echo "== chromium"
 export_arg=
+if [ "${1:-}" = full ]; then
+	shift
+	# The whole browser, as on the console (the image made for it); the
+	# pictures go to chromium-frames/ and GX_INPUT is the user's script.
+	rm -rf "$OUT/chromium-frames"
+	mkdir -p "$OUT/chromium-frames"
+	export GX_FRAMES=$OUT/chromium-frames GX_INPUT=${GX_INPUT:-}
+	exec timeout ${GX_TIMEOUT:-300} $QEMU "$OUT/gx" ${GX_TRACE:+-t} -n -w -A $FULL_ADDRESS \
+		-e XDG_RUNTIME_DIR=/run -e WAYLAND_DISPLAY=wayland-0 "$OUT/chromium-full-switch.ext4" \
+		/usr/lib/chromium/chromium $FULL_FLAGS --disable-gpu ${GX_JS---js-flags=--jitless} \
+		"${@:-file:///usr/share/gx/page.html}"
+fi
 if [ "${1:-}" = wayland ]; then
 	# The Chromium that has a window, on gx's Wayland display (wl.c). The
 	# pictures go to chromium-frames/ and GX_INPUT is the user's script.

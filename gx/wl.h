@@ -17,6 +17,10 @@
  * XDG_RUNTIME_DIR=/run and WAYLAND_DISPLAY=wayland-0. */
 int wl_start(void);
 
+/* Where the window has the address of the page, for the keyboard to come up
+ * when it is touched or asked for: chromium-shell's if this is not called. */
+void wl_address_bar(int left, int top, int right, int bottom);
+
 /* What the host provides, called from the one thread of wl.c, together with
  * host_input() of cdp.h for what the user does. */
 
