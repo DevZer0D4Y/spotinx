@@ -37,25 +37,11 @@ This is experimental software.
 
 Confirmed on a real console:
 
-- Google, Wikipedia and YouTube load and are usable; YouTube videos play.
+- Google, Wikipedia and YouTube load and are usable; YouTube videos play but sometimes crash.
 - GPU rendering and the JIT.
 - Touch, scrolling, text entry with the system keyboard, d-pad focus.
 
-Known problems and limits:
-
-- **Nothing is kept between sessions**: no cookies, no cache, no history.
-- **The interface is `chromium-shell`'s**: four text buttons and an address
-  bar. No tabs, bookmarks, settings page or extensions.
-
-## Install
-
-1. Build (below), or get the three files from someone who did.
-2. Back up `atmosphere/hbl.nsp` on the SD card, then replace it with
-   `gx/dist-hbl/atmosphere/hbl.nsp`.
-3. Copy the folder `gx/dist-nx/switch/chromium-nx/` to `/switch/` on the SD
-   card. It holds `chromium-nx.nro` and `chromium.ext4` (Chromium and the
-   Linux files around it).
-4. Start **Chromium NX** from the Homebrew Menu. It opens google.com.
+Downloads are stored in profile.ext4
 
 The log of the last run is `/switch/chromium-nx/chromium-nx.log`.
 
