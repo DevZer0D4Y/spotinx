@@ -103,6 +103,9 @@ ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
 CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256UL<<30) \
 	-I$DEVKITPRO/libnx/include -I$PORTLIBS/include -I$OUT/include -I$SRC/nx -I$SRC \
 	-iquote $OUT/lkl"
+if [ "${SPOTINX:-0}" = 1 ]; then
+	CFLAGS="$CFLAGS -DSPOTINX"
+fi
 objs=
 for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/host_nx.c \
 	"$OUT"/gl_table.c "$SRC"/../nro/source/nx_host.c "$OUT"/lkl/iomem.c "$OUT"/lkl/jmp_buf.c \
@@ -117,7 +120,11 @@ ${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map"
 	$objs "$OUT/lkl-nro.o" -L$PORTLIBS/lib -L$DEVKITPRO/libnx/lib \
 	-lavcodec -ldav1d -lswresample -lavutil \
 	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lpng -lturbojpeg -lz -lnx -lm -o "$OUT/gx.elf"
-nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
+if [ "${SPOTINX:-0}" = 1 ]; then
+	nacptool --create "SpotinX" "DevZer0D4Y" "0.3.0-alpha" "$OUT/gx.nacp"
+else
+	nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
+fi
 elf2nro "$OUT/gx.elf" "$OUT/gx.nro" --nacp="$OUT/gx.nacp" --icon="$SRC/nx/icon.jpg"
 
 echo "== SD card"
@@ -132,7 +139,11 @@ for log in "$APP"/*.log; do
 done
 rm -rf "$DIST"
 mkdir -p "$APP"
-cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
+if [ "${SPOTINX:-0}" = 1 ]; then
+	cp "$OUT/gx.nro" "$APP/SpotinX.nro"
+else
+	cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
+fi
 if [ -n "${DEV:-}" ]; then
 	[ -e "$PC_SYSROOT/bin/hello" ] ||
 		{ echo "run build-pc.sh first: it makes the guest programs"; exit 1; }
