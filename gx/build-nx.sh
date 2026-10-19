@@ -105,6 +105,9 @@ CFLAGS="-g -O2 -Wall -ffunction-sections $ARCH -D__SWITCH__ -DGX_ARENA_SIZE=(256
 	-iquote $OUT/lkl"
 if [ "${SPOTINX:-0}" = 1 ]; then
 	CFLAGS="$CFLAGS -DSPOTINX"
+	if [ "${SPOTINX_BOOT_TEST:-0}" = 1 ]; then
+		CFLAGS="$CFLAGS -DSPOTINX_BOOT_TEST"
+	fi
 fi
 objs=
 for f in "$SRC"/tramp.S "$SRC"/nx/exception.S "$SRC"/gmem.c "$SRC"/gelf.c "$SRC"/gsys.c "$SRC"/nat.c "$SRC"/cdp.c "$SRC"/wl.c "$SRC"/glwin.c "$SRC"/video.c "$SRC"/host_nx.c \
@@ -121,7 +124,11 @@ ${CROSS}g++ -specs=$DEVKITPRO/libnx/switch.specs -g $ARCH -Wl,-Map,"$OUT/gx.map"
 	-lavcodec -ldav1d -lswresample -lavutil \
 	-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lpng -lturbojpeg -lz -lnx -lm -o "$OUT/gx.elf"
 if [ "${SPOTINX:-0}" = 1 ]; then
-	nacptool --create "SpotinX" "DevZer0D4Y" "0.3.0-alpha" "$OUT/gx.nacp"
+	if [ "${SPOTINX_BOOT_TEST:-0}" = 1 ]; then
+		nacptool --create "SpotinX Boot Test" "DevZer0D4Y" "0.3.2-alpha" "$OUT/gx.nacp"
+	else
+		nacptool --create "SpotinX" "DevZer0D4Y" "0.3.2-alpha" "$OUT/gx.nacp"
+	fi
 else
 	nacptool --create "Chromium NX" "shodowlo" "0.1" "$OUT/gx.nacp"
 fi
@@ -140,7 +147,11 @@ done
 rm -rf "$DIST"
 mkdir -p "$APP"
 if [ "${SPOTINX:-0}" = 1 ]; then
-	cp "$OUT/gx.nro" "$APP/SpotinX.nro"
+	if [ "${SPOTINX_BOOT_TEST:-0}" = 1 ]; then
+		cp "$OUT/gx.nro" "$APP/SpotinX-BootTest.nro"
+	else
+		cp "$OUT/gx.nro" "$APP/SpotinX.nro"
+	fi
 else
 	cp "$OUT/gx.nro" "$APP/chromium-nx.nro"
 fi

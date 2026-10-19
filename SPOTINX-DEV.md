@@ -42,3 +42,24 @@ Spotify authentication and music playback are **not verified**. Chromium
 NX may not provide Widevine DRM; Spotify web playback may remain unsupported
 even if the UI loads. No Nintendo system browser is used. The application
 is unofficial and not affiliated with Spotify.
+
+## Isolate browser startup cost (0.3.2 alpha)
+
+The CI artifact includes two executables built from the same source:
+
+- `SpotinX.nro`: opens Spotify, the normal application.
+- `SpotinX-BootTest.nro`: opens the bundled, local
+  `file:///usr/share/gx/page.html` instead of Spotify. It does not
+  need a network connection for its start page.
+
+The two executables use the same Chromium filesystem, startup options and
+persisted profile. They must be launched separately, not concurrently.
+The boot test is a diagnostic tool, **not** an authentication workaround.
+Both write to `/switch/chromium-nx/chromium-nx.log`; the newer launch
+overwrites the previous log. Save results separately before starting the
+other executable.
+
+Compare the `gx: spotinx:` timing lines, especially
+`Chromium launch` and `first browser frame`, across the two runs.
+If the timings remain comparable, most delay is in browser startup and
+the emulation/storage path rather than the Spotify page itself.

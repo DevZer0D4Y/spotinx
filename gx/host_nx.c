@@ -69,6 +69,11 @@
  * This intentionally uses the existing Chromium NX assets on the SD card,
  * including a separate persistent profile: profile-switchify-kiosk.ext4. */
 #ifdef SPOTINX
+#ifdef SPOTINX_BOOT_TEST
+#define SPOTINX_START_URL "file:///usr/share/gx/page.html"
+#else
+#define SPOTINX_START_URL "https://open.spotify.com/"
+#endif
 #define SPOTINX_COMMAND \
 	"-w -b -c3 @chromium-full.ext4 =profile-switchify-kiosk.ext4 -A225,46,1150,80 " \
 	"/usr/lib/chromium/chromium --no-sandbox --single-process --no-zygote " \
@@ -77,7 +82,7 @@
 	"--test-type --password-store=basic --disable-background-networking " \
 	"--disable-component-update --disk-cache-size=33554432 --media-cache-size=33554432 " \
 	"--disable-quic --hide-crash-restore-bubble --enable-spatial-navigation " \
-	"--remote-debugging-pipe --disable-gpu --kiosk https://open.spotify.com/"
+	"--remote-debugging-pipe --disable-gpu --kiosk " SPOTINX_START_URL
 #endif
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on

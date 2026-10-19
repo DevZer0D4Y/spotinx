@@ -41,16 +41,21 @@ jobs:
           grep -q 'SPOTINX_COMMAND' gx/host_nx.c
           grep -q 'https://open.spotify.com/' gx/host_nx.c
 
-      - name: Build SpotinX
+      - name: Build SpotinX and offline startup test
         env:
           SPOTINX: "1"
         run: |
+          mkdir -p /tmp/spotinx-artifacts
           bash gx/build-nx.sh
           test -s gx/dist-nx/switch/chromium-nx/SpotinX.nro
+          cp gx/dist-nx/switch/chromium-nx/SpotinX.nro /tmp/spotinx-artifacts/
+          SPOTINX_BOOT_TEST=1 bash gx/build-nx.sh
+          test -s gx/dist-nx/switch/chromium-nx/SpotinX-BootTest.nro
+          cp gx/dist-nx/switch/chromium-nx/SpotinX-BootTest.nro /tmp/spotinx-artifacts/
 
-      - name: Upload NRO
+      - name: Upload NROs
         uses: actions/upload-artifact@v4
         with:
-          name: SpotinX-NRO-experimental
-          path: gx/dist-nx/switch/chromium-nx/SpotinX.nro
+          name: SpotinX-Startup-Comparison
+          path: /tmp/spotinx-artifacts/*.nro
           if-no-files-found: error
