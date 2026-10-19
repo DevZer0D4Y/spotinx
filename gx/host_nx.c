@@ -65,6 +65,20 @@
 	"--no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist " \
 	"--disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland " \
 	"--enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
+/* SpotinX builds use the separately tested Chromium No GPU + Kiosk setup.
+ * This intentionally uses the existing Chromium NX assets on the SD card,
+ * including a separate persistent profile: profile-switchify-kiosk.ext4. */
+#ifdef SPOTINX
+#define SPOTINX_COMMAND \
+	"-w -b -c3 @chromium-full.ext4 =profile-switchify-kiosk.ext4 -A225,46,1150,80 " \
+	"/usr/lib/chromium/chromium --no-sandbox --single-process --no-zygote " \
+	"--ozone-platform=wayland --user-data-dir=/root/profile --no-first-run " \
+	"--no-default-browser-check --disable-breakpad --disable-crashpad-for-testing " \
+	"--test-type --password-store=basic --disable-background-networking " \
+	"--disable-component-update --disk-cache-size=33554432 --media-cache-size=33554432 " \
+	"--disable-quic --hide-crash-restore-bubble --enable-spatial-navigation " \
+	"--remote-debugging-pipe --disable-gpu --kiosk https://open.spotify.com/"
+#endif
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on
  * a busy site went through 192 MB and the kernel panicked. With a profile
@@ -2561,7 +2575,14 @@ int main(int argc, char **argv)
 		svcExitProcess();   /* see __libnx_initheap() */
 	}
 	mkdir(GX_DIR, 0777);
+#ifdef SPOTINX
+	/* A dedicated homebrew entry: launch Spotify directly, bypassing the
+	 * Chromium NX programs.txt menu without changing Chromium NX itself. */
+	strcpy(commands[0], SPOTINX_COMMAND);
+	command_count = 0;
+#else
 	read_commands();
+#endif
 	choice = command_count ? menu(&pad) : 0;
 	if (choice < 0) {
 		consoleExit(NULL);
