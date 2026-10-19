@@ -1088,7 +1088,10 @@ static EGLBoolean gl_terminate(EGLDisplay dpy)
 {
 	EGLBoolean ret = eglTerminate(dpy);
 
+#ifndef SPOTINX
+	/* The original Chromium NX can return to the diagnostic console. */
 	console_back();
+#endif
 	return ret;
 }
 
@@ -2590,6 +2593,12 @@ int main(int argc, char **argv)
 	}
 	consoleClear();
 	log_file = fopen(GX_DIR "/chromium-nx.log", "w");
+#ifdef SPOTINX
+	/* Leave the text console before loading the browser. The first
+	 * software-rendered Chromium frame will take the screen instead.
+	 * All diagnostics continue to be written to chromium-nx.log. */
+	console_off();
+#endif
 
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,
