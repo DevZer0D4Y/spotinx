@@ -65,6 +65,25 @@
 	"--no-zygote --use-gl=angle --use-angle=gles-egl --ignore-gpu-blocklist " \
 	"--disable-gpu-sandbox --in-process-gpu --ozone-platform=wayland " \
 	"--enable-spatial-navigation --remote-debugging-pipe https://www.google.com/"
+/* SpotinX builds use the separately tested Chromium No GPU + Kiosk setup.
+ * This intentionally uses the existing Chromium NX assets on the SD card,
+ * including a separate persistent profile: profile-switchify-kiosk.ext4. */
+#ifdef SPOTINX
+#ifdef SPOTINX_BOOT_TEST
+#define SPOTINX_START_URL "file:///usr/share/gx/page.html"
+#else
+#define SPOTINX_START_URL "https://open.spotify.com/"
+#endif
+#define SPOTINX_COMMAND \
+	"-w -b -c3 @chromium-full.ext4 =profile-switchify-kiosk.ext4 -A225,46,1150,80 " \
+	"/usr/lib/chromium/chromium --no-sandbox --single-process --no-zygote " \
+	"--ozone-platform=wayland --user-data-dir=/root/profile --no-first-run " \
+	"--no-default-browser-check --disable-breakpad --disable-crashpad-for-testing " \
+	"--test-type --password-store=basic --disable-background-networking " \
+	"--disable-component-update --disk-cache-size=33554432 --media-cache-size=33554432 " \
+	"--disable-quic --hide-crash-restore-bubble --enable-spatial-navigation " \
+	"--remote-debugging-pipe --disable-gpu --kiosk " SPOTINX_START_URL
+#endif
 /* The kernel's memory holds every file that is not on the root image (its
  * /tmp, a browser's profile and cache) and its network buffers: a browser on
  * a busy site went through 192 MB and the kernel panicked. With a profile
@@ -88,6 +107,13 @@ static Mutex print_lock, mem_lock, screen_lock;
 static FILE *log_file;
 static volatile int finished;
 static volatile int console_on = 1;   /* changed under screen_lock */
+#ifdef SPOTINX
+static u64 spotinx_boot_start;
+static unsigned long spotinx_boot_ms(void)
+{
+	return (unsigned long)(armTicksToNs(armGetSystemTick() - spotinx_boot_start) / 1000000ULL);
+}
+#endif
 
 /*
  * The console and whoever takes the screen from it. The console draws under
@@ -152,8 +178,15 @@ void host_console_write(int fd, const void *buf, size_t len)
 		 * once in a while, and its last lines are what tells where. */
 		if (!started)
 			started = now;
+#ifdef SPOTINX
+		/* On microSD, per-line fsync at launch can stall Chromium.
+		 * Continue writing every message; sync at most once a second.
+		 * Fatal error paths still use sync_log() explicitly. */
+		if (gx_trace || armTicksToNs(now - synced) >= 1000000000ULL) {
+#else
 		if (armTicksToNs(now - started) < 20000000000ULL ||
 		    armTicksToNs(now - synced) > (gx_trace ? 20000000ULL : 250000000ULL)) {
+#endif
 			print_stage = 3;
 			fsync(fileno(log_file));
 			synced = now;
@@ -1074,7 +1107,10 @@ static EGLBoolean gl_terminate(EGLDisplay dpy)
 {
 	EGLBoolean ret = eglTerminate(dpy);
 
+#ifndef SPOTINX
+	/* The original Chromium NX can return to the diagnostic console. */
 	console_back();
+#endif
 	return ret;
 }
 
@@ -1848,6 +1884,13 @@ void host_present(const uint8_t *pixels, int width, int height, int stride)
 		pixels = packed;
 	}
 	screen_show(pixels, width, height, 1, 1);
+#ifdef SPOTINX
+	static int first_frame;
+	if (!first_frame++) {
+		host_log("gx: spotinx: first browser frame at %lu ms\n", spotinx_boot_ms());
+		sync_log();
+	}
+#endif
 }
 
 /*
@@ -2201,6 +2244,9 @@ static void run(void *arg)
 	long params[6] = { LKL_CLOCK_REALTIME, (long)&now };
 	int ret, net_id = -1, disk_id = -1, profile_id = -1;
 
+#ifdef SPOTINX
+	host_log("gx: spotinx: kernel init at %lu ms\n", spotinx_boot_ms());
+#endif
 	host_log("gx: starting the kernel (%s)\n", KERNEL_ARGS);
 	/* Where LKL's virtio devices tell the kernel they exist. */
 	lkl_host_ops.virtio_devices = lkl_virtio_devs;
@@ -2251,6 +2297,9 @@ static void run(void *arg)
 		host_log("gx: the kernel did not start (%d)\n", ret);
 		host_exit(1);
 	}
+#ifdef SPOTINX
+	host_log("gx: spotinx: kernel ready at %lu ms\n", spotinx_boot_ms());
+#endif
 	/* The kernel has no clock to read the date from and starts in 1970. */
 	lkl_syscall(__lkl__NR_clock_settime, params);
 	if (net_id >= 0)
@@ -2305,6 +2354,9 @@ static void run(void *arg)
 		if (import_tree(GX_DIR "/sysroot", ""))
 			host_exit(1);
 	}
+#ifdef SPOTINX
+	host_log("gx: spotinx: root mounted at %lu ms\n", spotinx_boot_ms());
+#endif
 	populate_root();
 	if (profile_mounted)
 		unlock_profile();
@@ -2324,6 +2376,9 @@ static void run(void *arg)
 		host_log("gx: cannot set up the pipe to Chromium\n");
 	if (wayland && wl_start())
 		host_log("gx: cannot open the Wayland display\n");
+#ifdef SPOTINX
+	host_log("gx: spotinx: Chromium launch at %lu ms\n", spotinx_boot_ms());
+#endif
 	host_log("gx: running %s\n\n", guest_argv[0]);
 	gx_exec(guest_argv[0], guest_argc, guest_argv, guest_env);
 	host_exit(1);
@@ -2549,6 +2604,9 @@ static int enough_addresses(PadState *pad)
 
 int main(int argc, char **argv)
 {
+#ifdef SPOTINX
+	spotinx_boot_start = armGetSystemTick();
+#endif
 	static Thread display_thread, watchdog_thread, probe_thread;
 	PadState pad;
 	int choice;
@@ -2561,7 +2619,14 @@ int main(int argc, char **argv)
 		svcExitProcess();   /* see __libnx_initheap() */
 	}
 	mkdir(GX_DIR, 0777);
+#ifdef SPOTINX
+	/* A dedicated homebrew entry: launch Spotify directly, bypassing the
+	 * Chromium NX programs.txt menu without changing Chromium NX itself. */
+	strcpy(commands[0], SPOTINX_COMMAND);
+	command_count = 0;
+#else
 	read_commands();
+#endif
 	choice = command_count ? menu(&pad) : 0;
 	if (choice < 0) {
 		consoleExit(NULL);
@@ -2569,6 +2634,12 @@ int main(int argc, char **argv)
 	}
 	consoleClear();
 	log_file = fopen(GX_DIR "/chromium-nx.log", "w");
+#ifdef SPOTINX
+	/* Leave the text console before loading the browser. The first
+	 * software-rendered Chromium frame will take the screen instead.
+	 * All diagnostics continue to be written to chromium-nx.log. */
+	console_off();
+#endif
 
 	if (commands[choice][0] == '[' && strchr(commands[choice], ']'))
 		memmove(commands[choice], strchr(commands[choice], ']') + 1,

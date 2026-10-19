@@ -1,0 +1,61 @@
+name: SpotinX NRO (experimental)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-nro:
+    name: Build Switch homebrew
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: devkitpro/devkita64:latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install kernel build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates flex bison bc libelf-dev cpio rsync build-essential
+
+      - name: Download Linux as a library
+        run: |
+          mkdir -p /work
+          git clone --depth 1 https://github.com/lkl/linux.git /work/linux
+          test -f /work/linux/tools/lkl/Makefile
+
+      - name: Prepare No GPU build inputs
+        run: |
+          # SpotinX reuses the Chromium filesystem already installed on the SD.
+          # No browser root images or host-side guest GL thunks are built here.
+          mkdir -p /work/gx-out
+          printf 'GX_THUNK(eglGetProcAddress)\n' > /work/gx-out/egl.list
+          : > /work/gx-out/gles.list
+          bash -n gx/build-nx.sh
+          grep -q 'SPOTINX_COMMAND' gx/host_nx.c
+          grep -q 'https://open.spotify.com/' gx/host_nx.c
+
+      - name: Build SpotinX and offline startup test
+        env:
+          SPOTINX: "1"
+        run: |
+          mkdir -p /tmp/spotinx-artifacts
+          bash gx/build-nx.sh
+          test -s gx/dist-nx/switch/chromium-nx/SpotinX.nro
+          cp gx/dist-nx/switch/chromium-nx/SpotinX.nro /tmp/spotinx-artifacts/
+          SPOTINX_BOOT_TEST=1 bash gx/build-nx.sh
+          test -s gx/dist-nx/switch/chromium-nx/SpotinX-BootTest.nro
+          cp gx/dist-nx/switch/chromium-nx/SpotinX-BootTest.nro /tmp/spotinx-artifacts/
+
+      - name: Upload NROs
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpotinX-Startup-Comparison
+          path: /tmp/spotinx-artifacts/*.nro
+          if-no-files-found: error
